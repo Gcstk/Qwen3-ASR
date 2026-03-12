@@ -2,6 +2,8 @@
 
 This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports multi-GPU training via `torchrun`.
 
+For turn detection built on top of Qwen3-ASR hidden states, see [TURN_DETECTION.md](TURN_DETECTION.md).
+
 ### 1) Setup
 
 First, please install the two Python packages `qwen-asr` and `datasets` using the command below.

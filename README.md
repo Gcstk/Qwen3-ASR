@@ -572,7 +572,9 @@ print(outputs[0].outputs[0].text)
 
 ## Fine Tuning
 
-Please refer to [Qwen3-ASR-Finetuning](finetuning/) for detailed instructions on fine-tuning Qwen3-ASR.
+Please refer to [Qwen3-ASR-Finetuning](finetuning/) for quick fine-tuning instructions on Qwen3-ASR.
+For a detailed Chinese getting-started guide focused on training, data preparation, and common fine-tuning strategies, see [TRAINING_GETTING_STARTED_ZH.md](doc/TRAINING_GETTING_STARTED_ZH.md).
+For endpoint classification / turn detection built on top of Qwen3-ASR, see [TURN_DETECTION.md](finetuning/TURN_DETECTION.md).
 
 
 ## Docker
