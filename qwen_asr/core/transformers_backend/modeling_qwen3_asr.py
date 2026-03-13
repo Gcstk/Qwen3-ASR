@@ -1,4 +1,41 @@
 # coding=utf-8
+"""Core model structure for the Hugging Face style Qwen3-ASR implementation.
+Qwen3-ASR 的 Hugging Face 风格核心结构实现。
+
+This file contains three stacks that cooperate during ASR inference:
+这个文件包含三个在 ASR 推理时协同工作的子结构：
+
+1. Audio encoder:
+1. 音频编码器：
+   log-mel features -> convolutional downsampling -> Transformer encoder ->
+   projected audio embeddings.
+   log-mel 特征 -> 卷积降采样 -> Transformer 编码器 -> 投影后的音频 embedding。
+2. Text decoder ("Thinker"):
+2. 文本解码器（“Thinker”）：
+   causal Transformer decoder that consumes text token embeddings plus the
+   injected audio embeddings and predicts the next token.
+   因果 Transformer 解码器，接收文本 token embedding 与注入后的音频 embedding，并预测下一个 token。
+3. Top-level generation wrapper:
+3. 顶层生成封装：
+   builds multimodal inputs, computes position ids / cache metadata and
+   delegates autoregressive decoding to the text decoder.
+   负责构造多模态输入、计算 position ids / cache 元数据，并把自回归解码委托给文本解码器。
+
+When reading the code, the most important path is:
+阅读代码时，最重要的主路径是：
+Qwen3ASRForConditionalGeneration
+  -> Qwen3ASRThinkerForConditionalGeneration
+  -> Qwen3ASRAudioEncoder / Qwen3ASRThinkerTextModel
+  -> Qwen3ASRThinkerTextDecoderLayer
+  -> Qwen3ASRTextAttention + Qwen3ASRTextMLP
+
+The file also contains a second set of Thinker-prefixed attention building
+blocks later on.
+这个文件后半部分还包含另一组带 Thinker 前缀的 attention 构件。
+They are architecturally equivalent helpers, but the main forward path above is
+the one currently wired into the ASR model in this file.
+它们在结构上是等价辅助实现，但当前真正接入这份 ASR 模型主前向路径的是上面这条链路。
+"""
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,7 +106,15 @@ class Qwen3ASRTextRMSNorm(nn.Module):
 
 
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
+    """Rotates half the hidden dims of the input.
+    对输入张量的一半隐藏维度做旋转。
+
+    Rotary position embedding (RoPE) interprets every two channels as a 2D
+    vector and applies a rotation determined by token position.
+    旋转位置编码（RoPE）把每两个通道视作一个二维向量，并按照 token 位置施加旋转。
+    `rotate_half` implements the quarter turn that is reused in the RoPE formula.
+    `rotate_half` 实现了 RoPE 公式里反复复用的那个四分之一转操作。
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -80,6 +125,15 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
     """
+    # Qwen3-ASR uses grouped-query attention in the text decoder.
+    # Qwen3-ASR 在文本解码器里使用 grouped-query attention。
+    #   - Q may have many heads
+    #   - Q 可以有更多的头
+    #   - K/V may have fewer heads
+    #   - K/V 可以只有更少的头
+    # For the actual attention matmul we repeat K/V groups so their head count
+    # matches Q.
+    # 真正做 attention 矩阵乘法时，需要把 K/V 分组复制展开，使它们的头数和 Q 对齐。
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -97,16 +151,26 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs: Unpack[TransformersKwargs],
 ):
+    # `query`, `key`, `value` are expected in attention layout:
+    # `query`、`key`、`value` 这里都假设已经是 attention 布局：
+    # (batch, num_heads, seq_len, head_dim)
+    # 即 `(batch, num_heads, seq_len, head_dim)`。
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # Raw attention scores: each query token compares itself with every key.
+    # 原始 attention 分数：每个 query token 都会和所有 key 做相似度比较。
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
+    # Softmax turns scores into probabilities; dropout is only active in train.
+    # Softmax 把分数变成概率；dropout 只在训练时生效。
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    # Weighted sum of values produces contextualized token representations.
+    # 对 value 做加权求和后，得到融合上下文信息的 token 表示。
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -133,6 +197,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # `cos` / `sin` are position-dependent rotation factors.
+    # `cos` / `sin` 是由位置决定的旋转系数。
+    # RoPE is applied to Q and K only, so that attention becomes position-aware
+    # without adding a standalone embedding vector to every hidden state.
+    # RoPE 只作用在 Q 和 K 上，这样 attention 就能感知位置，同时不需要给每个 hidden state 额外加一份独立位置向量。
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -182,6 +251,10 @@ class Qwen3ASRTextAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # `hidden_states`: (batch, seq_len, hidden_size)
+        # `hidden_states` 的形状是 `(batch, seq_len, hidden_size)`。
+        # We project it into Q / K / V and then reshape into multiple heads.
+        # 接着把它线性投影成 Q / K / V，再 reshape 成多头形式。
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -193,7 +266,12 @@ class Qwen3ASRTextAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            # During autoregressive generation we do not recompute old K/V.
+            # 自回归生成时，我们不会重复计算历史 token 的 K/V。
+            # The cache stores previous keys/values and appends the new step.
+            # cache 会存下历史 key/value，并把当前步的新结果接到后面。
+            # `cache_position` matters for static cache layouts.
+            # 对静态 cache 布局来说，`cache_position` 决定新内容该写到哪里。
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
@@ -212,6 +290,8 @@ class Qwen3ASRTextAttention(nn.Module):
             **kwargs,
         )
 
+        # Merge heads back to `(batch, seq_len, hidden_size)`.
+        # 把多头结果重新合并回 `(batch, seq_len, hidden_size)`。
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
@@ -229,6 +309,13 @@ class Qwen3ASRTextMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # SwiGLU-style FFN:
+        # SwiGLU 风格的前馈网络：
+        #   act(W_gate x) * (W_up x) -> W_down
+        #   先做门控激活和逐元素相乘，再投影回隐藏维度。
+        # Compared with a plain 2-layer MLP, this gated variant usually gives
+        # better capacity per parameter in modern decoder-only Transformers.
+        # 相比普通的两层 MLP，这种带门控的变体通常在现代 decoder-only Transformer 中有更高的参数利用效率。
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -256,6 +343,14 @@ class Qwen3ASRThinkerTextDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        # Pre-norm decoder block:
+        # pre-norm 形式的 decoder block：
+        #   x = x + SelfAttention(RMSNorm(x))
+        #   x = x + SelfAttention(RMSNorm(x))
+        #   x = x + MLP(RMSNorm(x))
+        #   x = x + MLP(RMSNorm(x))
+        # This layout is more stable for deep Transformers than post-norm.
+        # 对很深的 Transformer 来说，这种布局通常比 post-norm 更稳定。
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -311,6 +406,11 @@ def _get_feat_extract_output_lengths(input_lengths):
     Computes the output length of the convolutional layers and the output length of the audio encoder
     """
 
+    # The audio tower downsamples time with three stride-2 convs.
+    # 音频塔会通过三层 stride-2 卷积对时间维做降采样。
+    # Inputs are processed chunk-by-chunk in 100-frame windows, so the output
+    # length is computed as "full windows contribution + tail contribution".
+    # 由于输入是按 100 帧窗口分块处理的，因此输出长度要按“完整窗口贡献 + 尾块贡献”来计算。
     input_lengths_leave = input_lengths % 100
     feat_lengths = (input_lengths_leave - 1) // 2 + 1
     output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
@@ -439,6 +539,11 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
         """
         mrope_position_deltas = []
 
+        # Position ids increase only on valid tokens (attention_mask == 1).
+        # 位置编号只会在有效 token（attention_mask == 1）上递增。
+        # Padding tokens are filled with a dummy index because they are masked
+        # out later and therefore will not affect attention.
+        # padding token 会被填成一个占位索引，因为它们后面会被 mask 掉，不会真正参与 attention。
         position_ids = attention_mask.float().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
         position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
@@ -481,7 +586,17 @@ class Qwen3ASRAudioAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
-        """Input shape: Batch x Time x Channel"""
+        """Self-attention over flattened audio chunks.
+        对展平后的音频 chunk 序列做自注意力。
+
+        `hidden_states` arrives as `(total_frames, embed_dim)` after valid frames
+        from multiple chunks have been packed together.
+        多个 chunk 的有效帧被打包后，`hidden_states` 的形状是 `(total_frames, embed_dim)`。
+        `cu_seqlens` tells Flash Attention where each chunk starts and ends, so
+        attention stays local to its chunk instead of mixing unrelated
+        utterances/chunks.
+        `cu_seqlens` 会告诉 Flash Attention 每个 chunk 的起止位置，这样 attention 只在 chunk 内部发生，不会把无关片段混在一起。
+        """
 
         seq_length, _ = hidden_states.size()
 
@@ -551,6 +666,8 @@ class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
+        # Standard Transformer encoder block with pre-norm residual structure.
+        # 标准的 Transformer encoder block，采用 pre-norm 残差结构。
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
@@ -678,6 +795,11 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length after cnn
         """
+        # `input_features` for one sample is arranged as `(num_mel_bins, time)`.
+        # 单条样本的 `input_features` 形状是 `(num_mel_bins, time)`。
+        # The encoder intentionally processes long utterances in fixed-size
+        # chunks before convolution to control memory growth.
+        # 编码器会故意在卷积前把长语音按固定大小切块，以控制内存增长。
         aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
 
@@ -690,6 +812,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
+        # Split each utterance into time chunks, pad them to a batch, then run
+        # the convolutional front-end on the padded chunk batch.
+        # 先把每条语音按时间切成多个 chunk，pad 成 batch，再统一过卷积前端。
         chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
         padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
@@ -698,7 +823,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             batch_first=True,
         )
         padded_feature = padded_feature.unsqueeze(1)
-        # Split to chunk to avoid OOM during convolution
+        # Convolution is additionally chunked along the batch dimension to avoid
+        # OOM when a single utterance expands into many chunks.
+        # 卷积阶段还会沿 batch 维再次分块，避免单条长语音拆出太多 chunk 时发生 OOM。
         padded_embeds = []
         for chunk in padded_feature.split(self.conv_chunksize, dim=0):
             padded_embed = F.gelu(self.conv2d1(chunk))
@@ -715,6 +842,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             .to(padded_embed.dtype)
         )
         padded_embed = padded_embed + positional_embedding
+        # Drop padded frames and pack all valid chunk frames into one long
+        # sequence. `cu_seqlens` below preserves chunk boundaries for attention.
+        # 去掉 padding 帧后，把所有有效 chunk 帧打包成一条长序列；下面的 `cu_seqlens` 会保留 chunk 边界供 attention 使用。
         hidden_states = padded_embed[padded_mask_after_cnn]
         cu_chunk_lens = [0]
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
@@ -736,6 +866,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
         hidden_states = self.ln_post(hidden_states)
         hidden_states = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states)
+        # Final projection matches the language model embedding size so the
+        # audio representations can replace `<audio>` placeholder token embeds.
+        # 最后的投影维度会对齐语言模型 embedding 维度，这样音频表示才能替换 `<audio>` 占位 token 的 embedding。
         hidden_states = self.proj2(hidden_states)
         return BaseModelOutput(last_hidden_state=hidden_states)
 
@@ -819,8 +952,12 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        # In contrast to other models, Qwen3ASRThinker has different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
+        # In contrast to plain 1D text RoPE, the implementation keeps three
+        # logical position streams and interleaves them.
+        # 和普通的一维文本 RoPE 不同，这里保留了三路逻辑位置流，并把它们交错组织。
+        # In this ASR path the three streams are usually identical, but the code
+        # keeps the more general MRoPE interface used by the broader Qwen family.
+        # 在这条 ASR 路径里，这三路位置通常是相同的，但代码仍保留了 Qwen 家族更通用的 MRoPE 接口。
         if position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
@@ -837,6 +974,14 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# The Thinker-prefixed blocks below mirror the decoder building blocks above.
+# 下面这组带 Thinker 前缀的模块，与上面的 decoder 构件在结构上基本对应。
+# In the current ASR forward path, `Qwen3ASRThinkerTextModel` instantiates
+# `Qwen3ASRThinkerTextDecoderLayer`, which itself uses `Qwen3ASRTextAttention`
+# and `Qwen3ASRTextMLP`.
+# 但在当前 ASR 主前向路径中，`Qwen3ASRThinkerTextModel` 实例化的是 `Qwen3ASRThinkerTextDecoderLayer`，而该层内部实际使用的是 `Qwen3ASRTextAttention` 和 `Qwen3ASRTextMLP`。
+# Keep this distinction in mind when tracing execution.
+# 追踪执行链路时要注意这个区别。
 class Qwen3ASRThinkerTextMLP(nn.Module):
     def __init__(self, config, intermediate_size=None):
         super().__init__()
@@ -1024,6 +1169,14 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         else:
             text_position_ids = position_ids[0]
 
+        # Build a decoder causal mask that combines:
+        # 构造 decoder 使用的因果 mask，它同时包含：
+        #   1. autoregressive masking (cannot attend to future tokens)
+        #   1. 自回归 mask（不能看未来 token）
+        #   2. optional padding masking
+        #   2. 可选的 padding mask
+        #   3. cache-aware slicing during generation
+        #   3. 生成阶段面向 cache 的切片逻辑
         attention_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -1035,10 +1188,12 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
+        # RoPE factors are computed once and reused across all decoder layers.
+        # RoPE 系数只计算一次，然后在所有 decoder layer 中复用。
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # decoder layers
+        # Decoder stack: every layer mixes the full left context into each token.
+        # Decoder 堆栈中的每一层都会把左侧全部上下文混入当前 token 表示。
         for layer_idx, decoder_layer in enumerate(self.layers):
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -1119,7 +1274,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths = None
         feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
     
-        # audio encoder do not support batch inference to keep precision
+        # Audio encoding is done sample-by-sample here.
+        # 这里的音频编码是按样本逐条进行的。
+        # The audio tower packs chunks internally and this path keeps the
+        # implementation simple while avoiding precision / masking issues from
+        # an additional outer batch.
+        # 音频塔内部已经会处理 chunk 打包，这种写法能让实现更直接，也能避免再套一层外部 batch 带来的精度和 mask 问题。
         audio_features = []
         for input_feature, feature_len in zip(input_features, feature_lens):
             audio_output = self.audio_tower(
@@ -1193,6 +1353,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         # 2. Merge text, audios
         if input_features is not None:
+            # The prompt already contains `<audio>` placeholder tokens.
+            # prompt 里已经放好了 `<audio>` 占位 token。
+            # After encoding the waveform features, we overwrite those token
+            # embeddings with continuous audio representations so the decoder
+            # sees one unified sequence of embeddings.
+            # 波形特征编码完成后，会用连续的音频表示去覆盖这些 token embedding，这样 decoder 看到的就是一条统一的 embedding 序列。
             audio_features = self.get_audio_features(
                 input_features,
                 feature_attention_mask=feature_attention_mask,
@@ -1213,6 +1379,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 or (cache_position is not None and cache_position[0] == 0)
                 or self.rope_deltas is None
             ):
+                # First decoding step: build fresh RoPE positions from the full
+                # prompt and remember the multimodal offset for later steps.
+                # 第一次解码时，要基于完整 prompt 重新构造 RoPE 位置，并记住后续增量解码要复用的多模态偏移量。
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
                 position_ids, rope_deltas = self.get_rope_index(
                     attention_mask,
@@ -1220,6 +1389,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 rope_deltas = rope_deltas - delta0
                 self.rope_deltas = rope_deltas
             else:
+                # Incremental generation step: reuse cached offset and only
+                # create positions for the new tokens.
+                # 增量生成阶段会复用缓存下来的偏移量，只为新增 token 生成位置编号。
                 batch_size, seq_length = input_ids.shape
                 delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
                 position_ids = torch.arange(seq_length, device=input_ids.device)
