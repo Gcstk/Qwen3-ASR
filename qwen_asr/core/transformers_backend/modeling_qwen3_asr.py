@@ -254,8 +254,7 @@ class Qwen3ASRTextAttention(nn.Module):
         # `hidden_states`: (batch, seq_len, hidden_size)
         # `hidden_states` 的形状是 `(batch, seq_len, hidden_size)`。
         # We project it into Q / K / V and then reshape into multiple heads.
-        # 接着把它线性投影成 Q / K / V，再 reshape 成多头形式。
-        input_shape = hidden_states.shape[:-1]
+        # 接着把它线性投影成 Q / K / V，再 reshape 成多头形式。         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
