@@ -1,6 +1,7 @@
 ## Fine-tuning Qwen3-ASR
 
 This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports multi-GPU training via `torchrun`.
+For a Chinese walkthrough focused on training code, model flow, `transformers.Trainer`, and future DeepSpeed integration, see [TRAINING_CODE_WALKTHROUGH_ZH.md](../doc/TRAINING_CODE_WALKTHROUGH_ZH.md).
 
 For turn detection built on top of Qwen3-ASR hidden states, see [TURN_DETECTION.md](TURN_DETECTION.md).
 

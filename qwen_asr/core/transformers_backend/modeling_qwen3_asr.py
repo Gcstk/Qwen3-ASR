@@ -1233,6 +1233,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
     def __init__(self, config):
         super().__init__(config)
+        # 这个类可以理解成“真正承载训练/生成逻辑的核心”：
+        # - audio_tower：把声学特征编码成连续向量；
+        # - model：文本/thinker 主干；
+        # - lm_head：把最后隐藏状态映射到词表 logits。
         self.audio_tower = Qwen3ASRAudioEncoder._from_config(config.audio_config)
         self.vocab_size = config.text_config.vocab_size
         self.model = Qwen3ASRThinkerTextModel._from_config(config.text_config)
@@ -1267,6 +1271,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
                 The length of feature shape of each audio in LLM.
         """
+        # 对训练理解最关键的一点：
+        # Qwen3-ASR 不是把音频单独送进另一个 decoder，而是先编码成连续向量，
+        # 再把这些向量插到文本序列里的 `<audio>` 位置上，
+        # 最后由同一个 thinker 统一处理。
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         else:
@@ -1300,6 +1308,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
         equal to the length of multimodal features. If the lengths are different, an error is raised.
         """
+        # 这个函数的作用是：找到 prompt 里所有“音频占位 token”的位置。
+        # 后面会把这些位置对应的 embedding 替换成真实音频表示。
         if input_ids is None:
             special_audio_mask = (
                 inputs_embeds
@@ -1346,6 +1356,11 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         """
 
+        # 对新手来说，可以把这个 forward 拆成四步理解：
+        # 1. 文本 token -> embedding
+        # 2. 音频特征 -> audio embedding
+        # 3. 用音频 embedding 覆盖 `<audio>` 占位
+        # 4. thinker 输出 hidden_states，再接 lm_head 变成 logits
         if inputs_embeds is None:
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1413,6 +1428,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         loss = None
         if labels is not None:
+            # 这里的 loss 本质上仍然是“下一个 token 预测”。
+            # 所以在 SFT 脚本里，我们才需要先把 prefix 区域 mask 成 -100。
             loss = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
             )
@@ -1486,6 +1503,10 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
         super().__init__(config)
         self.config = config
 
+        # 顶层类本身很薄，真正的活都在 thinker 里。
+        # 这么设计的好处是：
+        # - 顶层接口保持简单；
+        # - 训练、生成、多模态融合都统一由 thinker 管理。
         self.thinker = Qwen3ASRThinkerForConditionalGeneration._from_config(config.thinker_config)
         self.post_init()
     
@@ -1500,6 +1521,8 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
         eos_token_id: int | list[int] = [151645, 151643],
         **kwargs,
     ):
+        # 这里本质上只是把顶层 generate 转发到 thinker.generate。
+        # 对调用方来说，仍然看到的是一个“完整 ASR 模型”的统一接口。
         shared_kwargs = {}
         thinker_kwargs = {
             "max_new_tokens": max_new_tokens,

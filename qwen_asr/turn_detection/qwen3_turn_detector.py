@@ -9,6 +9,22 @@
 #   - incomplete
 # "waiting" is left to the policy/LLM layer after ASR, because it is usually
 # a response-control intent rather than an end-of-utterance boundary problem.
+"""
+这个文件实现了一个“复用 Qwen3-ASR 底座的二分类器”。
+
+可以把它理解成：
+    Qwen3-ASR backbone + classifier head
+
+背后的设计思路是：
+1. 不重新训练一个音频模型；
+2. 直接复用 Qwen3-ASR 已经学到的声学 / 韵律 / 多模态表示；
+3. 在顶部接一个轻量分类头，预测 complete / incomplete。
+
+对新手来说，最值得理解的是 `_encode()`：
+- 它并没有走文本生成；
+- 而是复用了 Qwen3-ASR 的“文本 embedding + 音频 embedding 融合 -> thinker”这条路径；
+- 最后从隐藏状态里池化出一个向量做分类。
+"""
 import json
 import os
 from dataclasses import dataclass
@@ -38,6 +54,7 @@ def _slice_candidate_window(
     left_context_ms: float,
     right_context_ms: float,
 ) -> np.ndarray:
+    """围绕候选切点裁出一个短窗口，供 turn detector 判断。"""
     if cut_time_ms is None:
         return wav
 
@@ -53,6 +70,7 @@ def _slice_candidate_window(
 
 
 def _build_turn_detection_messages(prompt: str, audio_payload: Any) -> List[Dict[str, Any]]:
+    """沿用 Qwen3-ASR 的 chat-style 输入协议。"""
     return [
         {"role": "system", "content": prompt or DEFAULT_TURN_DETECTION_PROMPT},
         {"role": "user", "content": [{"type": "audio", "audio": audio_payload}]},
@@ -60,6 +78,12 @@ def _build_turn_detection_messages(prompt: str, audio_payload: Any) -> List[Dict
 
 
 def build_turn_detection_prompt_text(processor, prompt: Optional[str] = None) -> str:
+    """
+    生成分类任务的 prefix_text。
+
+    注意这里虽然最后不是“生成文本”，但仍然复用了 Qwen3-ASR 原本的输入模板，
+    这样可以最大程度贴近底座的预训练 / 推理分布。
+    """
     messages = _build_turn_detection_messages(prompt or DEFAULT_TURN_DETECTION_PROMPT, None)
     prompt_text = processor.apply_chat_template(
         [messages],
@@ -103,6 +127,8 @@ class Qwen3TurnDetector(nn.Module):
         if pooling not in {"last_token", "mean"}:
             raise ValueError(f"Unsupported pooling={pooling}")
 
+        # backbone 就是完整的 Qwen3-ASR 模型；
+        # classifier 是这个文件新增的小头。
         self.backbone = backbone
         self.processor = processor
         self.base_model_path = base_model_path
@@ -137,6 +163,11 @@ class Qwen3TurnDetector(nn.Module):
         num_labels: int = 2,
         **kwargs,
     ) -> "Qwen3TurnDetector":
+        """
+        先按普通 ASR 模型加载底座，再包装成 turn detector。
+
+        这是“复用预训练权重”的真正入口。
+        """
         asr_wrapper = Qwen3ASRModel.from_pretrained(
             base_model_path,
             max_inference_batch_size=1,
@@ -159,6 +190,7 @@ class Qwen3TurnDetector(nn.Module):
         map_location: Optional[Union[str, torch.device]] = None,
         **kwargs,
     ) -> "Qwen3TurnDetector":
+        """从 turn detector checkpoint 恢复模型。"""
         config_path = os.path.join(checkpoint_path, "turn_detector_config.json")
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Missing config file: {config_path}")
@@ -205,6 +237,13 @@ class Qwen3TurnDetector(nn.Module):
         safe_serialization: bool = False,
         **kwargs,
     ):
+        """
+        保存 detector 自己的权重和配置。
+
+        这里不依赖 Hugging Face AutoModel 的默认保存逻辑，而是显式写出：
+        - pytorch_model.bin
+        - turn_detector_config.json
+        """
         os.makedirs(save_directory, exist_ok=True)
         payload = state_dict if state_dict is not None else self.state_dict()
         weights_path = os.path.join(save_directory, "pytorch_model.bin")
@@ -225,6 +264,16 @@ class Qwen3TurnDetector(nn.Module):
         freeze_text_model: bool = True,
         unfreeze_last_n_layers: int = 0,
     ):
+        """
+        控制训练时哪些参数参与更新。
+
+        默认推荐：
+        - 冻结 audio_tower
+        - 冻结 thinker 文本部分
+        - 只训练 classifier
+
+        如果任务数据更多、效果不够，再逐步解冻高层。
+        """
         for p in self.backbone.parameters():
             p.requires_grad = False
 
@@ -253,11 +302,25 @@ class Qwen3TurnDetector(nn.Module):
         input_features: Optional[torch.Tensor] = None,
         feature_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        复用 Qwen3-ASR 的多模态编码路径，产出最后一层隐藏状态。
+
+        对理解模型结构最关键的一步是：
+        1. 先把文本 prompt 变成 token embedding；
+        2. 再把音频波形编码成连续 audio_features；
+        3. 用 audio_features 覆盖 prompt 里的 `<audio>` 占位 embedding；
+        4. 把整条融合后的 embedding 序列送入 thinker。
+
+        这也是为什么 turn detector 能“吃到底座已经学到的音频知识”。
+        """
         thinker = self.backbone.thinker
 
         inputs_embeds = thinker.get_input_embeddings()(input_ids)
 
         if input_features is not None:
+            # `get_audio_features` 把 mel 特征编码成连续向量；
+            # `get_placeholder_mask` 找出 prompt 中 `<audio>` 占位的位置；
+            # `masked_scatter` 则把占位 token 的 embedding 替换成真实音频表示。
             audio_features = thinker.get_audio_features(
                 input_features,
                 feature_attention_mask=feature_attention_mask,
@@ -268,6 +331,8 @@ class Qwen3TurnDetector(nn.Module):
 
         position_ids = None
         if attention_mask is not None:
+            # 这里沿用底座原本的 RoPE 位置编码逻辑，确保分类任务看到的序列位置定义
+            # 与 ASR 主任务保持一致。
             delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
             position_ids, rope_deltas = thinker.get_rope_index(attention_mask)
             thinker.rope_deltas = rope_deltas - delta0
@@ -281,6 +346,12 @@ class Qwen3TurnDetector(nn.Module):
         return outputs.last_hidden_state
 
     def _pool_hidden_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        把整条序列的隐藏状态压成一个向量。
+
+        - `last_token` 更接近“取 assistant 起始位的最终表征”；
+        - `mean` 更像把整条序列做平均。
+        """
         if self.pooling == "mean":
             mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
             denom = mask.sum(dim=1).clamp_min(1.0)
@@ -301,6 +372,10 @@ class Qwen3TurnDetector(nn.Module):
         labels: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> SequenceClassifierOutput:
+        """
+        标准二分类前向：
+        hidden_states -> pooling -> classifier -> cross entropy
+        """
         hidden_states = self._encode(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -322,6 +397,14 @@ class Qwen3TurnDetector(nn.Module):
         right_context_ms: Optional[Union[float, List[float]]] = None,
         prompt: Optional[Union[str, List[str]]] = None,
     ) -> Dict[str, torch.Tensor]:
+        """
+        预测阶段的数据整理逻辑。
+
+        和训练时的 collator 类似，但这里直接支持：
+        - 单条音频；
+        - 多条音频；
+        - 路径 / ndarray / (waveform, sr) 等输入格式。
+        """
         audios = audio if isinstance(audio, list) else [audio]
         cut_list = cut_time_ms if isinstance(cut_time_ms, list) else [cut_time_ms] * len(audios)
         left_list = left_context_ms if isinstance(left_context_ms, list) else [left_context_ms] * len(audios)
@@ -365,6 +448,13 @@ class Qwen3TurnDetector(nn.Module):
         right_context_ms: float = 600.0,
         prompt: Optional[str] = None,
     ) -> TurnDetectorPrediction:
+        """
+        方便直接推理单条样本。
+
+        返回值里显式给出两类概率，方便业务层做阈值控制：
+        - 若 complete_prob 很高，可以认为用户说完了；
+        - 若两类接近，可以交给上层策略决定是否继续等待。
+        """
         was_training = self.training
         self.eval()
         inputs = self._prepare_audio_batch(

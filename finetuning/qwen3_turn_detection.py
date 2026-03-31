@@ -1,6 +1,20 @@
 # coding=utf-8
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
+"""
+基于 Qwen3-ASR 底座做 turn detection（二分类）的训练脚本。
+
+和 ASR SFT 脚本相比，这里最大的区别是：
+- 不再训练生成文本；
+- 而是把 Qwen3-ASR 当作音频-文本 backbone，最后接一个分类头；
+- 标签只预测 `complete / incomplete`。
+
+如果你是 Transformers 新手，可以这样理解：
+1. Dataset 先提供音频、候选切点和标签；
+2. Collator 把音频裁成窗口并编码；
+3. 模型前向得到 logits；
+4. Trainer 负责反向传播、保存 checkpoint、评估指标。
+"""
 import argparse
 import os
 import re
@@ -23,6 +37,7 @@ _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
 
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """用于 `--resume 1` 自动恢复训练。"""
     if not output_dir or not os.path.isdir(output_dir):
         return None
     best_step = None
@@ -40,6 +55,7 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
 
 def load_audio(path: str, sr: int = 16000):
+    """统一读成 16k 单声道。"""
     wav, _ = librosa.load(path, sr=sr, mono=True)
     return wav
 
@@ -51,6 +67,13 @@ def slice_candidate_window(
     left_context_ms: float,
     right_context_ms: float,
 ) -> np.ndarray:
+    """
+    围绕候选结束点裁出训练窗口。
+
+    这里体现了当前 turn detection 的任务定义：
+    - 不是拿整段会话做分类；
+    - 而是围绕某个 VAD 给出的候选结束点，看这是不是“真的说完了”。
+    """
     if cut_time_ms is None:
         return wav
     cut_sample = int(round(float(cut_time_ms) * sr / 1000.0))
@@ -64,6 +87,7 @@ def slice_candidate_window(
 
 
 def normalize_label(label: str) -> str:
+    """把标签规范化成脚本约定的两类。"""
     s = str(label).strip().lower()
     if s not in TURN_LABELS:
         raise ValueError(f"Unsupported label={label!r}. Supported labels: {TURN_LABELS}")
@@ -71,6 +95,12 @@ def normalize_label(label: str) -> str:
 
 
 def make_preprocess_fn(processor, default_prompt: str):
+    """
+    提前做轻量预处理：
+    - 标准化标签；
+    - 生成 prompt_text；
+    - 不提前读取音频。
+    """
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
         prompt = ex.get("prompt", "") or default_prompt
         label = normalize_label(ex["label"])
@@ -95,6 +125,14 @@ class DataCollatorForQwen3TurnDetection:
     default_right_context_ms: float = 600.0
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        把一批 turn detection 样本整理成模型输入。
+
+        关键步骤：
+        1. 从原始音频里裁出候选窗口；
+        2. 用 processor 同时编码 prompt_text 和音频；
+        3. 额外补上分类标签 `labels`。
+        """
         wavs = []
         prompt_texts = []
         labels = []
@@ -127,6 +165,7 @@ class DataCollatorForQwen3TurnDetection:
 
 
 class CastFloatInputsTrainer(Trainer):
+    """和 ASR 训练脚本同理：把浮点输入自动 cast 到模型 dtype。"""
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
@@ -139,6 +178,7 @@ class CastFloatInputsTrainer(Trainer):
 
 class MakeEveryCheckpointLoadableCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
+        """每次保存 checkpoint 时写出自定义 detector 配置。"""
         if args.process_index != 0:
             return control
         model = kwargs.get("model", None)
@@ -151,6 +191,13 @@ class MakeEveryCheckpointLoadableCallback(TrainerCallback):
 
 
 def compute_metrics(eval_pred):
+    """
+    这里故意只算最基础的二分类指标，方便新手先把训练链路跑通。
+
+    当前最关心的是：
+    - accuracy：整体是否学到了；
+    - complete_precision / recall / f1：系统会不会过早“抢答”。
+    """
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
     labels = labels.astype(np.int64)
@@ -186,6 +233,10 @@ def parse_args():
     p.add_argument("--default_left_context_ms", type=float, default=2000.0)
     p.add_argument("--default_right_context_ms", type=float, default=600.0)
 
+    # 参数冻结策略是这个脚本最重要的工程设计之一：
+    # - 默认冻结整个 backbone，只训练分类头；
+    # - 如果效果不够，再尝试逐步解冻高层；
+    # - 这样可以在数据不多时，最大限度复用底座的音频知识。
     p.add_argument("--freeze_audio_tower", type=int, default=1)
     p.add_argument("--freeze_text_model", type=int, default=1)
     p.add_argument("--unfreeze_last_n_layers", type=int, default=0)
@@ -218,6 +269,7 @@ def main():
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required. Expected fields: audio, label, optional prompt/cut_time_ms.")
 
+    # 和 ASR 训练脚本一样，优先走 bf16；否则退到 fp16。
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     model = Qwen3TurnDetector.from_qwen3_asr_pretrained(
         args_cli.model_path,
@@ -232,6 +284,7 @@ def main():
         unfreeze_last_n_layers=args_cli.unfreeze_last_n_layers,
     )
 
+    # 仍然沿用 JSON/JSONL，保持和 ASR SFT 相同的数据加载习惯。
     raw_ds = load_dataset(
         "json",
         data_files={
@@ -241,6 +294,7 @@ def main():
     )
     ds = raw_ds.map(make_preprocess_fn(model.processor, args_cli.default_prompt), num_proc=1)
 
+    # 只保留训练真正需要的列。
     keep = {
         "audio",
         "label_id",
@@ -261,6 +315,10 @@ def main():
         default_right_context_ms=args_cli.default_right_context_ms,
     )
 
+    # 这里的 TrainingArguments 基本就是 Hugging Face Trainer 的通用训练配置。
+    # 当前脚本同样还没有直接接入 DeepSpeed CLI。
+    # 如果你以后想把这个脚本升级到 deepspeed，最自然的改法还是：
+    # HfArgumentParser + dataclass + --deepspeed。
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
         per_device_train_batch_size=args_cli.batch_size,
@@ -305,6 +363,7 @@ def main():
         resume_from = find_latest_checkpoint(training_args.output_dir) or ""
 
     if resume_from:
+        # Trainer 会自动恢复模型、优化器、学习率调度器等状态。
         if trainer.args.process_index == 0:
             print(f"[resume] resume_from_checkpoint = {resume_from}")
         trainer.train(resume_from_checkpoint=resume_from)
@@ -312,6 +371,7 @@ def main():
         trainer.train()
 
     if trainer.args.process_index == 0:
+        # 训练结束后再保存一份最终模型，避免只剩中间 checkpoint。
         trainer.save_model(training_args.output_dir)
 
 
