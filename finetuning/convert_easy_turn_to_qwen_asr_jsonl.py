@@ -39,7 +39,9 @@ import json
 import os
 import re
 import random
+import sys
 import tarfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -253,6 +255,17 @@ def parse_args():
         help=(
             "Random seed used when sampling prompts from the template pool. Keeping this "
             "fixed makes the conversion process reproducible."
+        ),
+    )
+    p.add_argument(
+        "--log_every",
+        type=int,
+        default=500,
+        help=(
+            "How often to print sample-level progress inside one shard. For example, "
+            "`500` means the script prints one progress line every 500 processed samples "
+            "plus the final sample of each shard. Set to 0 to disable sample-level "
+            "progress logs and keep only shard-level logs."
         ),
     )
     return p.parse_args()
@@ -512,6 +525,24 @@ def maybe_write_bad_record(path: Optional[Path], payload: Dict[str, object]) -> 
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def log(message: str) -> None:
+    """Print one timestamped log line to stdout and flush immediately."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"[convert_easy_turn][{ts}] {message}", file=sys.stdout, flush=True)
+
+
+def format_seconds(seconds: float) -> str:
+    """Format a duration into a short human-readable string."""
+    seconds_int = max(0, int(round(seconds)))
+    mins, sec = divmod(seconds_int, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs}h{mins:02d}m{sec:02d}s"
+    if mins > 0:
+        return f"{mins}m{sec:02d}s"
+    return f"{sec}s"
+
+
 def main():
     args = parse_args()
     if args.prompt_mode == "fixed" and not args.fixed_prompt.strip():
@@ -532,16 +563,34 @@ def main():
         if bad_records_path.exists():
             bad_records_path.unlink()
 
+    shard_paths = list(read_lines(args.shards_list))
+    total_shards = len(shard_paths)
+    if total_shards == 0:
+        raise ValueError(f"No valid shard path found in --shards_list: {args.shards_list}")
+
     used_names: Dict[str, int] = defaultdict(int)
     num_written = 0
     num_skipped = 0
+    total_start_time = time.time()
+
+    log(
+        "Start conversion with "
+        f"shards={total_shards}, output_jsonl={output_jsonl}, audio_dir={audio_dir}, "
+        f"output_format={args.output_format}, prompt_mode={args.prompt_mode}, "
+        f"log_every={args.log_every}"
+    )
+    if bad_records_path is not None:
+        log(f"Bad records will be written to: {bad_records_path}")
 
     with open(output_jsonl, "w", encoding="utf-8") as fout:
-        for shard_path in read_lines(args.shards_list):
+        for shard_idx, shard_path in enumerate(shard_paths, start=1):
+            shard_start_time = time.time()
             shard_path_obj = Path(shard_path)
             shard_name = shard_path_obj.name
+            log(f"[shard {shard_idx}/{total_shards}] Reading shard: {shard_path_obj}")
             if not shard_path_obj.exists():
                 num_skipped += 1
+                log(f"[shard {shard_idx}/{total_shards}] Missing shard, skipped: {shard_path_obj}")
                 maybe_write_bad_record(
                     bad_records_path,
                     {
@@ -552,7 +601,14 @@ def main():
                 continue
 
             grouped = iter_shard_records(str(shard_path_obj))
-            for sample_id, sample in grouped.items():
+            shard_total_samples = len(grouped)
+            shard_written = 0
+            shard_skipped = 0
+            log(
+                f"[shard {shard_idx}/{total_shards}] Loaded {shard_total_samples} grouped samples "
+                f"from {shard_name}"
+            )
+            for sample_idx, (sample_id, sample) in enumerate(grouped.items(), start=1):
                 wav_bytes = sample.get("wav_bytes")
                 raw_txt = str(sample.get("txt", ""))
                 raw_task = str(sample.get("task", ""))
@@ -561,6 +617,7 @@ def main():
 
                 if wav_bytes is None and args.skip_missing_wav == 1:
                     num_skipped += 1
+                    shard_skipped += 1
                     maybe_write_bad_record(
                         bad_records_path,
                         {
@@ -579,6 +636,7 @@ def main():
 
                 if (not raw_txt.strip()) and args.skip_missing_txt == 1:
                     num_skipped += 1
+                    shard_skipped += 1
                     maybe_write_bad_record(
                         bad_records_path,
                         {
@@ -649,7 +707,28 @@ def main():
 
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 num_written += 1
+                shard_written += 1
 
+                if args.log_every > 0 and (
+                    sample_idx % args.log_every == 0 or sample_idx == shard_total_samples
+                ):
+                    log(
+                        f"[shard {shard_idx}/{total_shards}] Progress {sample_idx}/{shard_total_samples} "
+                        f"| shard_written={shard_written} shard_skipped={shard_skipped} "
+                        f"| total_written={num_written} total_skipped={num_skipped}"
+                    )
+
+            log(
+                f"[shard {shard_idx}/{total_shards}] Finished {shard_name} "
+                f"| samples={shard_total_samples} written={shard_written} skipped={shard_skipped} "
+                f"| elapsed={format_seconds(time.time() - shard_start_time)}"
+            )
+
+    total_elapsed = time.time() - total_start_time
+    log(
+        f"Conversion finished | shards={total_shards} written={num_written} "
+        f"skipped={num_skipped} | elapsed={format_seconds(total_elapsed)}"
+    )
     print(
         json.dumps(
             {
@@ -659,6 +738,9 @@ def main():
                 "num_skipped": num_skipped,
                 "prompt_mode": args.prompt_mode,
                 "audio_path_mode": args.audio_path_mode,
+                "output_format": args.output_format,
+                "log_every": args.log_every,
+                "elapsed_seconds": round(total_elapsed, 3),
             },
             ensure_ascii=False,
             indent=2,
