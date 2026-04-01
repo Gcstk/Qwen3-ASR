@@ -27,6 +27,7 @@
 """
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -101,6 +102,7 @@ class TurnDetectorPrediction:
     complete_prob: float
     incomplete_prob: float
     logits: Optional[List[float]] = None
+    latency_ms: Optional[float] = None
 
 
 class Qwen3TurnDetector(nn.Module):
@@ -440,14 +442,15 @@ class Qwen3TurnDetector(nn.Module):
         return inputs
 
     @torch.no_grad()
-    def predict(
+    def predict_batch(
         self,
-        audio: AudioLike,
-        cut_time_ms: Optional[float] = None,
-        left_context_ms: float = 2000.0,
-        right_context_ms: float = 600.0,
-        prompt: Optional[str] = None,
-    ) -> TurnDetectorPrediction:
+        audio: Union[AudioLike, List[AudioLike]],
+        cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
+        left_context_ms: Optional[Union[float, List[float]]] = None,
+        right_context_ms: Optional[Union[float, List[float]]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
+        threshold: float = 0.5,
+    ) -> List[TurnDetectorPrediction]:
         """
         方便直接推理单条样本。
 
@@ -464,15 +467,52 @@ class Qwen3TurnDetector(nn.Module):
             right_context_ms=right_context_ms,
             prompt=prompt,
         )
-        inputs = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+        moved_inputs = {}
+        for key, value in inputs.items():
+            if torch.is_tensor(value):
+                value = value.to(self.device)
+                if value.is_floating_point():
+                    value = value.to(self.dtype)
+            moved_inputs[key] = value
+        inputs = moved_inputs
+        start = time.perf_counter()
         outputs = self(**inputs)
-        probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
-        pred_id = int(torch.argmax(outputs.logits, dim=-1)[0].item())
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        probs = torch.softmax(outputs.logits, dim=-1).tolist()
         if was_training:
             self.train()
-        return TurnDetectorPrediction(
-            label=self.id2label[pred_id],
-            complete_prob=float(probs[self.label2id["complete"]]),
-            incomplete_prob=float(probs[self.label2id["incomplete"]]),
-            logits=outputs.logits[0].tolist(),
-        )
+
+        per_item_ms = elapsed_ms / max(1, len(probs))
+        predictions: List[TurnDetectorPrediction] = []
+        for row_idx, row_probs in enumerate(probs):
+            complete_prob = float(row_probs[self.label2id["complete"]])
+            pred_label = "complete" if complete_prob >= float(threshold) else "incomplete"
+            predictions.append(
+                TurnDetectorPrediction(
+                    label=pred_label,
+                    complete_prob=complete_prob,
+                    incomplete_prob=float(row_probs[self.label2id["incomplete"]]),
+                    logits=outputs.logits[row_idx].tolist(),
+                    latency_ms=per_item_ms,
+                )
+            )
+        return predictions
+
+    @torch.no_grad()
+    def predict(
+        self,
+        audio: AudioLike,
+        cut_time_ms: Optional[float] = None,
+        left_context_ms: float = 2000.0,
+        right_context_ms: float = 600.0,
+        prompt: Optional[str] = None,
+        threshold: float = 0.5,
+    ) -> TurnDetectorPrediction:
+        return self.predict_batch(
+            audio=[audio],
+            cut_time_ms=[cut_time_ms],
+            left_context_ms=[left_context_ms],
+            right_context_ms=[right_context_ms],
+            prompt=[prompt],
+            threshold=threshold,
+        )[0]

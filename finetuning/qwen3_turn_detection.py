@@ -25,9 +25,10 @@ import librosa
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import Trainer, TrainerCallback, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
 
 from qwen_asr.turn_detection import DEFAULT_TURN_DETECTION_PROMPT, Qwen3TurnDetector
+from qwen_asr.turn_detection.metrics import summarize_binary_classification
 from qwen_asr.turn_detection.qwen3_turn_detector import (
     TURN_LABELS,
     build_turn_detection_prompt_text,
@@ -198,26 +199,41 @@ def compute_metrics(eval_pred):
     - accuracy：整体是否学到了；
     - complete_precision / recall / f1：系统会不会过早“抢答”。
     """
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    labels = labels.astype(np.int64)
-    acc = float((preds == labels).mean())
+    logits = eval_pred.predictions if hasattr(eval_pred, "predictions") else eval_pred[0]
+    labels = eval_pred.label_ids if hasattr(eval_pred, "label_ids") else eval_pred[1]
+    logits = np.asarray(logits, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+    if logits.ndim > 2:
+        logits = logits.reshape(-1, logits.shape[-1])
+    if labels.ndim > 1:
+        labels = labels.reshape(-1)
 
-    def _binary_metrics(pos_id: int):
-        tp = int(((preds == pos_id) & (labels == pos_id)).sum())
-        fp = int(((preds == pos_id) & (labels != pos_id)).sum())
-        fn = int(((preds != pos_id) & (labels == pos_id)).sum())
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = 2 * precision * recall / max(1e-8, precision + recall)
-        return precision, recall, f1
+    logits = logits - logits.max(axis=-1, keepdims=True)
+    probs = np.exp(logits)
+    probs = probs / np.maximum(1e-12, probs.sum(axis=-1, keepdims=True))
+    complete_prob = probs[:, TURN_LABELS.index("complete")]
 
-    complete_precision, complete_recall, complete_f1 = _binary_metrics(TURN_LABELS.index("complete"))
+    summary = summarize_binary_classification(
+        labels,
+        complete_prob,
+        pos_label=TURN_LABELS.index("complete"),
+        target_precision=0.97,
+    )
+    default_metrics = summary["threshold_default_0_5"]
     return {
-        "accuracy": acc,
-        "complete_precision": complete_precision,
-        "complete_recall": complete_recall,
-        "complete_f1": complete_f1,
+        "accuracy": float(default_metrics["accuracy"]),
+        "complete_precision": float(default_metrics["precision"]),
+        "complete_recall": float(default_metrics["recall"]),
+        "complete_f1": float(default_metrics["f1"]),
+        "auroc": float(summary["auroc"]),
+        "auprc": float(summary["auprc"]),
+        "brier": float(summary["brier"]),
+        "ece": float(summary["ece"]),
+        "complete_precision_high_precision": float(summary["threshold_high_precision"]["precision"]),
+        "complete_recall_high_precision": float(summary["threshold_high_precision"]["recall"]),
+        "complete_f1_high_precision": float(summary["threshold_high_precision"]["f1"]),
+        "threshold_high_precision": float(summary["threshold_high_precision"]["threshold"]),
+        "threshold_balanced_f1": float(summary["threshold_balanced_f1"]["threshold"]),
     }
 
 
@@ -261,6 +277,11 @@ def parse_args():
 
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--load_best_model_at_end", type=int, default=1)
+    p.add_argument("--metric_for_best_model", type=str, default="eval_complete_f1")
+    p.add_argument("--greater_is_better", type=int, default=1)
+    p.add_argument("--early_stopping_patience", type=int, default=0)
     return p.parse_args()
 
 
@@ -268,6 +289,7 @@ def main():
     args_cli = parse_args()
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required. Expected fields: audio, label, optional prompt/cut_time_ms.")
+    set_seed(int(args_cli.seed))
 
     # 和 ASR 训练脚本一样，优先走 bf16；否则退到 fp16。
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
@@ -337,8 +359,8 @@ def main():
         save_steps=args_cli.save_steps,
         save_total_limit=args_cli.save_total_limit,
         save_safetensors=False,
-        eval_strategy="steps",
-        eval_steps=args_cli.save_steps,
+        eval_strategy="steps" if args_cli.eval_file else "no",
+        eval_steps=args_cli.save_steps if args_cli.eval_file else None,
         do_eval=bool(args_cli.eval_file),
         bf16=use_bf16,
         fp16=not use_bf16,
@@ -346,7 +368,15 @@ def main():
         remove_unused_columns=False,
         report_to="none",
         label_names=["labels"],
+        seed=int(args_cli.seed),
+        load_best_model_at_end=bool(args_cli.load_best_model_at_end) and bool(args_cli.eval_file),
+        metric_for_best_model=args_cli.metric_for_best_model if args_cli.eval_file else None,
+        greater_is_better=bool(args_cli.greater_is_better) if args_cli.eval_file else None,
     )
+
+    callbacks: List[TrainerCallback] = [MakeEveryCheckpointLoadableCallback()]
+    if args_cli.eval_file and int(args_cli.early_stopping_patience) > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=int(args_cli.early_stopping_patience)))
 
     trainer = CastFloatInputsTrainer(
         model=model,
@@ -355,7 +385,7 @@ def main():
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         compute_metrics=compute_metrics if args_cli.eval_file else None,
-        callbacks=[MakeEveryCheckpointLoadableCallback()],
+        callbacks=callbacks,
     )
 
     resume_from = (args_cli.resume_from or "").strip()
