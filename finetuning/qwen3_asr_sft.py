@@ -288,6 +288,7 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
 
     # Audio
+    # 音频采样率。
     p.add_argument("--sr", type=int, default=16000)
 
     # Train hyper-params
@@ -300,13 +301,18 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--epochs", type=float, default=1)
     p.add_argument("--log_steps", type=int, default=10)
+    # 学习率调度器类型，控制训练过程中学习率怎么变化。当前走的是 Hugging Face TrainingArguments 的标准选项，比如 linear、cosine。它和 warmup_ratio 一起决定学习率曲线。
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
 
     # DataLoader
+    # 开多少个子进程并行准备 batch
     p.add_argument("--num_workers", type=int, default=4)
+    # 是否把 batch 放到 page-locked memory，GPU 训练时通常开着更利于拷贝到显存。
     p.add_argument("--pin_memory", type=int, default=1)
+    # 如果 num_workers > 0，worker 在一个 epoch 结束后是否保留，不每轮重启。通常能减少反复创建进程的开销。
     p.add_argument("--persistent_workers", type=int, default=1)
+    # 每个 worker 预先准备多少个 batch。值越大，吞吐通常更稳，但更占内存。
     p.add_argument("--prefetch_factor", type=int, default=2)
 
     # Save

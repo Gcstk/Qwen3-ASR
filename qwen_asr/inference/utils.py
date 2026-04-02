@@ -111,6 +111,18 @@ def ensure_list(x: MaybeList) -> List[Any]:
 
 
 def is_url(s: str) -> bool:
+    """
+    粗略判断一个字符串是否像 HTTP/HTTPS URL。
+
+    这个函数的目的不是做严格的 URL 校验，而是给音频输入分流：
+    - 如果像 URL，就走“先下载再解码音频”的路径
+    - 否则继续尝试把它当 base64 或本地路径处理
+
+    为什么这里只检查 scheme 和 netloc：
+    - 对当前场景来说已经足够
+    - 可以避免引入过重的校验逻辑
+    - 即使误判，后续加载失败也会在真正读取音频时暴露出来
+    """
     try:
         u = urlparse(s)
         return u.scheme in ("http", "https") and bool(u.netloc)
@@ -119,6 +131,18 @@ def is_url(s: str) -> bool:
 
 
 def is_probably_base64(s: str) -> bool:
+    """
+    粗略判断一个字符串是否“看起来像”一段 base64 音频。
+
+    当前采用的是启发式规则，不是严格校验：
+    1. 如果是 `data:audio...` 这种 data URI，直接认为是 base64 音频
+    2. 如果字符串非常长，而且不像路径（不含 `/` 或 `\\`），也倾向认为它是 base64
+
+    这样设计的原因：
+    - 推理入口既支持本地路径，也支持 URL，也支持 base64
+    - 需要一个便宜的分流器，先决定大概走哪条读取逻辑
+    - 真正的正确性由后面的 `base64.b64decode` 和音频解码保证
+    """
     if s.startswith("data:audio"):
         return True
     if ("/" not in s and "\\" not in s) and len(s) > 256:
@@ -127,34 +151,83 @@ def is_probably_base64(s: str) -> bool:
 
 
 def decode_base64_bytes(b64: str) -> bytes:
+    """
+    把 base64 字符串解码成原始字节。
+
+    兼容两类输入：
+    - 纯 base64 内容
+    - `data:audio/...;base64,...` 这种 data URI
+
+    对 data URI，会先把前缀元信息去掉，只保留逗号后面的真正 base64 部分。
+    """
     if "," in b64 and b64.strip().startswith("data:"):
         b64 = b64.split(",", 1)[1]
     return base64.b64decode(b64)
 
 
 def load_audio_any(x: str) -> Tuple[np.ndarray, int]:
+    """
+    统一读取字符串形式的音频输入，返回 `(audio, sr)`。
+
+    支持三类字符串输入：
+    - URL
+    - base64 音频字符串
+    - 本地文件路径
+
+    返回值里的 `audio` 还不保证已经是：
+    - 单声道
+    - 16kHz
+    - [-1, 1] 范围
+
+    这些后处理会在 `normalize_audio_input()` 里继续完成。
+    这里的职责只是一件事：把“各种字符串来源”读成波形和采样率。
+    """
     if is_url(x):
+        # URL 路径：先下载字节，再用 soundfile 从内存里解码。
+        # 这里不用先落地临时文件，能减少一次磁盘 IO。
         with urllib.request.urlopen(x) as resp:
             audio_bytes = resp.read()
         with io.BytesIO(audio_bytes) as f:
             audio, sr = sf.read(f, dtype="float32", always_2d=False)
     elif is_probably_base64(x):
+        # base64 路径：先还原字节，再从内存字节流里解码。
         audio_bytes = decode_base64_bytes(x)
         with io.BytesIO(audio_bytes) as f:
             audio, sr = sf.read(f, dtype="float32", always_2d=False)
     else:
+        # 本地文件路径：直接用 librosa 读取。
+        # 这里显式设置 `sr=None`，表示先保留原始采样率，不在这一步重采样。
+        # `mono=False` 表示先保留声道信息，后面再统一做单声道转换。
         audio, sr = librosa.load(x, sr=None, mono=False)
 
+    # 统一转成 float32，避免后续不同音频后端返回不同 dtype。
     audio = np.asarray(audio, dtype=np.float32)
     sr = int(sr)
     return audio, sr
 
 
 def to_mono(audio: np.ndarray) -> np.ndarray:
+    """
+    把音频统一转成单声道 waveform。
+
+    为什么这里要单独做单声道：
+    - 模型后续统一按单通道输入处理
+    - 不同音频解码后，声道维可能排列方式不同
+
+    支持的情况：
+    - `(T,)`：本来就是单声道，直接返回
+    - `(T, C)`：常见的 soundfile 输出格式
+    - `(C, T)`：某些管线里会采用这种布局
+
+    对二维输入，这里最终使用“多声道求平均”的方式合成单声道。
+    这是语音推理里最稳妥、最常见的默认做法。
+    """
     if audio.ndim == 1:
         return audio
     # soundfile can return shape (T, C); some pipelines use (C, T)
     if audio.ndim == 2:
+        # 如果第一维很小、第二维明显更大，通常更像 `(C, T)`，
+        # 这里转置成 `(T, C)` 后再按最后一维求平均。
         if audio.shape[0] <= 8 and audio.shape[1] > audio.shape[0]:
             audio = audio.T
         return np.mean(audio, axis=-1).astype(np.float32)
@@ -162,6 +235,19 @@ def to_mono(audio: np.ndarray) -> np.ndarray:
 
 
 def float_range_normalize(audio: np.ndarray) -> np.ndarray:
+    """
+    把波形整理成 float32，并尽量规范到 [-1, 1]。
+
+    这一步不是做响度归一化，而是做“数值范围安全化”：
+    - 如果本来就是合理 float 波形，基本不会改动
+    - 如果解码后数值超出 [-1, 1]，则按峰值做保守缩放
+    - 最后再做一次 clip，避免极少数异常值继续泄漏到模型
+
+    为什么只在 `peak > 1.0` 时缩放：
+    - 有些输入本来就是标准 float32 波形，范围已在 [-1, 1]
+    - 没必要对正常样本重复缩放
+    - 这里只处理“明显超范围”的情况
+    """
     audio = audio.astype(np.float32)
     if audio.size == 0:
         return audio
@@ -177,7 +263,19 @@ def float_range_normalize(audio: np.ndarray) -> np.ndarray:
 
 def normalize_audio_input(a: AudioLike) -> np.ndarray:
     """
-    Normalize one audio input to mono 16k float32 waveform in [-1, 1].
+    把一条音频输入统一规范成：
+
+    - 单声道
+    - 16kHz
+    - `float32`
+    - 幅值范围尽量落在 `[-1, 1]`
+
+    这是推理前最核心的一步“输入标准化”。
+
+    为什么需要统一到这个格式：
+    1. 仓库内部默认按 16kHz 处理音频
+    2. 多声道音频如果不先合并，会导致后续特征提取接口不一致
+    3. 不同数据源可能返回不同 dtype、不同数值范围，不先规整容易让模型输入分布漂移
 
     Supported inputs:
         - str: local file path / https URL / base64 audio string
@@ -188,20 +286,43 @@ def normalize_audio_input(a: AudioLike) -> np.ndarray:
             Mono 16k float32 waveform in [-1, 1].
     """
     if isinstance(a, str):
+        # 字符串输入统一交给 `load_audio_any()`。
+        # 它会根据内容自动分流：
+        # - URL
+        # - base64
+        # - 本地路径
         audio, sr = load_audio_any(a)
     elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):
+        # 直接传 `(waveform, sr)` 时，不再做额外 I/O，
+        # 直接取出数组和采样率进入后续标准化流程。
         audio, sr = a[0], int(a[1])
     else:
         raise TypeError(f"Unsupported audio input type: {type(a)}")
 
+    # 第一步：统一转单声道。
+    # 这样后续重采样和特征提取只需要处理一维 waveform。
     audio = to_mono(np.asarray(audio))
+
+    # 第二步：如果采样率不是目标采样率 16k，则重采样到 16k。
+    # 这里使用 librosa.resample，是因为它对常见语音推理场景足够稳定。
     if sr != SAMPLE_RATE:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE).astype(np.float32)
+
+    # 第三步：做 dtype 和数值范围规整。
+    # 注意这一步不是“让每条音频听起来一样响”，而是把数值整理到模型期望的安全范围。
     audio = float_range_normalize(audio)
+
+    # 返回的一定是一维、16k、float32 的 waveform。
     return audio
 
 
 def normalize_audios(audios: Union[AudioLike, List[AudioLike]]) -> List[np.ndarray]:
+    """
+    批量版本的 `normalize_audio_input()`。
+
+    这里先用 `ensure_list()` 把单条输入也包装成列表，
+    然后逐条做标准化，最终统一返回 `List[np.ndarray]`。
+    """
     items = ensure_list(audios)
     return [normalize_audio_input(a) for a in items]
 
