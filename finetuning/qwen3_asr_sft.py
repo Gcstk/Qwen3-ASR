@@ -319,6 +319,9 @@ def parse_args():
     p.add_argument("--save_strategy", type=str, default="steps")
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--save_total_limit", type=int, default=5)
+    # 验证步数。默认值 0 表示跟随 save_steps，这样兼容旧行为。
+    # 如果你觉得当前验证过于频繁，可以显式传更大的值，比如 1000 或 2000。
+    p.add_argument("--eval_steps", type=int, default=0)
 
     # Resume
     p.add_argument("--resume_from", type=str, default="")
@@ -365,6 +368,7 @@ def main():
             ds[split] = ds[split].remove_columns(drop)
 
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
+    eval_steps = int(args_cli.eval_steps) if int(args_cli.eval_steps) > 0 else int(args_cli.save_steps)
 
     # TrainingArguments 是 Transformers Trainer 的“训练总开关”。
     # 你可以把它理解成：
@@ -389,7 +393,7 @@ def main():
         save_total_limit=args_cli.save_total_limit,
         save_safetensors=True,
         eval_strategy="steps",
-        eval_steps=args_cli.save_steps,
+        eval_steps=eval_steps,
         do_eval=bool(args_cli.eval_file),
         bf16=use_bf16,
         fp16=not use_bf16,
