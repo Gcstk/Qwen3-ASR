@@ -27,8 +27,9 @@
 """
 import json
 import os
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -101,6 +102,34 @@ class TurnDetectorPrediction:
     complete_prob: float
     incomplete_prob: float
     logits: Optional[List[float]] = None
+    latency_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None
+    full_inference_ms: Optional[float] = None
+
+
+def normalize_turn_detector_batch_inputs(
+    audio: Union[AudioLike, List[AudioLike]],
+    cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
+    left_context_ms: Optional[Union[float, List[float]]] = None,
+    right_context_ms: Optional[Union[float, List[float]]] = None,
+    prompt: Optional[Union[str, List[str]]] = None,
+) -> Tuple[List[AudioLike], List[Optional[float]], List[Optional[float]], List[Optional[float]], List[Optional[str]]]:
+    audios = audio if isinstance(audio, list) else [audio]
+    cut_list = cut_time_ms if isinstance(cut_time_ms, list) else [cut_time_ms] * len(audios)
+    left_list = left_context_ms if isinstance(left_context_ms, list) else [left_context_ms] * len(audios)
+    right_list = right_context_ms if isinstance(right_context_ms, list) else [right_context_ms] * len(audios)
+    prompt_list = prompt if isinstance(prompt, list) else [prompt] * len(audios)
+
+    if not (len(audios) == len(cut_list) == len(left_list) == len(right_list) == len(prompt_list)):
+        raise ValueError("Batch size mismatch in audio/cut/prompt inputs")
+
+    return (
+        list(audios),
+        list(cut_list),
+        list(left_list),
+        list(right_list),
+        list(prompt_list),
+    )
 
 
 class Qwen3TurnDetector(nn.Module):
@@ -405,14 +434,13 @@ class Qwen3TurnDetector(nn.Module):
         - 多条音频；
         - 路径 / ndarray / (waveform, sr) 等输入格式。
         """
-        audios = audio if isinstance(audio, list) else [audio]
-        cut_list = cut_time_ms if isinstance(cut_time_ms, list) else [cut_time_ms] * len(audios)
-        left_list = left_context_ms if isinstance(left_context_ms, list) else [left_context_ms] * len(audios)
-        right_list = right_context_ms if isinstance(right_context_ms, list) else [right_context_ms] * len(audios)
-        prompt_list = prompt if isinstance(prompt, list) else [prompt] * len(audios)
-
-        if not (len(audios) == len(cut_list) == len(left_list) == len(right_list) == len(prompt_list)):
-            raise ValueError("Batch size mismatch in audio/cut/prompt inputs")
+        audios, cut_list, left_list, right_list, prompt_list = normalize_turn_detector_batch_inputs(
+            audio=audio,
+            cut_time_ms=cut_time_ms,
+            left_context_ms=left_context_ms,
+            right_context_ms=right_context_ms,
+            prompt=prompt,
+        )
 
         wavs = []
         prompt_texts = []
@@ -440,21 +468,16 @@ class Qwen3TurnDetector(nn.Module):
         return inputs
 
     @torch.no_grad()
-    def predict(
+    def _predict_batch_impl(
         self,
-        audio: AudioLike,
-        cut_time_ms: Optional[float] = None,
-        left_context_ms: float = 2000.0,
-        right_context_ms: float = 600.0,
-        prompt: Optional[str] = None,
-    ) -> TurnDetectorPrediction:
-        """
-        方便直接推理单条样本。
-
-        返回值里显式给出两类概率，方便业务层做阈值控制：
-        - 若 complete_prob 很高，可以认为用户说完了；
-        - 若两类接近，可以交给上层策略决定是否继续等待。
-        """
+        audio: Union[AudioLike, List[AudioLike]],
+        cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
+        left_context_ms: Optional[Union[float, List[float]]] = None,
+        right_context_ms: Optional[Union[float, List[float]]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
+        threshold: float = 0.5,
+    ) -> List[TurnDetectorPrediction]:
+        total_start = time.perf_counter()
         was_training = self.training
         self.eval()
         inputs = self._prepare_audio_batch(
@@ -464,15 +487,111 @@ class Qwen3TurnDetector(nn.Module):
             right_context_ms=right_context_ms,
             prompt=prompt,
         )
-        inputs = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+        moved_inputs = {}
+        for key, value in inputs.items():
+            if torch.is_tensor(value):
+                value = value.to(self.device)
+                if value.is_floating_point():
+                    value = value.to(self.dtype)
+            moved_inputs[key] = value
+        inputs = moved_inputs
+        model_start = time.perf_counter()
         outputs = self(**inputs)
-        probs = torch.softmax(outputs.logits, dim=-1)[0].tolist()
-        pred_id = int(torch.argmax(outputs.logits, dim=-1)[0].item())
+        model_elapsed_ms = (time.perf_counter() - model_start) * 1000.0
+        probs = torch.softmax(outputs.logits, dim=-1).tolist()
+        total_elapsed_ms = (time.perf_counter() - total_start) * 1000.0
         if was_training:
             self.train()
-        return TurnDetectorPrediction(
-            label=self.id2label[pred_id],
-            complete_prob=float(probs[self.label2id["complete"]]),
-            incomplete_prob=float(probs[self.label2id["incomplete"]]),
-            logits=outputs.logits[0].tolist(),
+
+        per_item_model_ms = model_elapsed_ms / max(1, len(probs))
+        per_item_full_ms = total_elapsed_ms / max(1, len(probs))
+        predictions: List[TurnDetectorPrediction] = []
+        for row_idx, row_probs in enumerate(probs):
+            complete_prob = float(row_probs[self.label2id["complete"]])
+            pred_label = "complete" if complete_prob >= float(threshold) else "incomplete"
+            predictions.append(
+                TurnDetectorPrediction(
+                    label=pred_label,
+                    complete_prob=complete_prob,
+                    incomplete_prob=float(row_probs[self.label2id["incomplete"]]),
+                    logits=outputs.logits[row_idx].tolist(),
+                    latency_ms=per_item_model_ms,
+                    ttft_ms=per_item_full_ms,
+                    full_inference_ms=per_item_full_ms,
+                )
+            )
+        return predictions
+
+    @torch.no_grad()
+    def predict_batch(
+        self,
+        audio: Union[AudioLike, List[AudioLike]],
+        cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
+        left_context_ms: Optional[Union[float, List[float]]] = None,
+        right_context_ms: Optional[Union[float, List[float]]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
+        threshold: float = 0.5,
+        measure_timings_per_sample: bool = False,
+    ) -> List[TurnDetectorPrediction]:
+        """
+        方便直接推理单条样本。
+
+        返回值里显式给出两类概率，方便业务层做阈值控制：
+        - 若 complete_prob 很高，可以认为用户说完了；
+        - 若两类接近，可以交给上层策略决定是否继续等待。
+        """
+        audios, cut_list, left_list, right_list, prompt_list = normalize_turn_detector_batch_inputs(
+            audio=audio,
+            cut_time_ms=cut_time_ms,
+            left_context_ms=left_context_ms,
+            right_context_ms=right_context_ms,
+            prompt=prompt,
         )
+        if measure_timings_per_sample and len(audios) > 1:
+            predictions: List[TurnDetectorPrediction] = []
+            for audio_item, cut_ms, left_ms, right_ms, prompt_item in zip(
+                audios,
+                cut_list,
+                left_list,
+                right_list,
+                prompt_list,
+            ):
+                predictions.extend(
+                    self._predict_batch_impl(
+                        audio=[audio_item],
+                        cut_time_ms=[cut_ms],
+                        left_context_ms=[left_ms],
+                        right_context_ms=[right_ms],
+                        prompt=[prompt_item],
+                        threshold=threshold,
+                    )
+                )
+            return predictions
+        return self._predict_batch_impl(
+            audio=audios,
+            cut_time_ms=cut_list,
+            left_context_ms=left_list,
+            right_context_ms=right_list,
+            prompt=prompt_list,
+            threshold=threshold,
+        )
+
+    @torch.no_grad()
+    def predict(
+        self,
+        audio: AudioLike,
+        cut_time_ms: Optional[float] = None,
+        left_context_ms: float = 2000.0,
+        right_context_ms: float = 600.0,
+        prompt: Optional[str] = None,
+        threshold: float = 0.5,
+    ) -> TurnDetectorPrediction:
+        return self.predict_batch(
+            audio=[audio],
+            cut_time_ms=[cut_time_ms],
+            left_context_ms=[left_context_ms],
+            right_context_ms=[right_context_ms],
+            prompt=[prompt],
+            threshold=threshold,
+            measure_timings_per_sample=True,
+        )[0]

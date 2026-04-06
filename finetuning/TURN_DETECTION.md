@@ -129,7 +129,62 @@ If classifier-only training is not enough, you can try:
 
 That keeps most of the backbone frozen while allowing the top decoder layers to adapt.
 
-### 7) Quick inference
+Recommended first-round matrix:
+
+- A1: classifier head only
+- A2: classifier head + top-4 text decoder layers
+- A3: classifier head + top-8 text decoder layers
+- B1: generative label baseline with LM head only
+- B2: generative label baseline + top-4 text decoder layers
+
+The helper script below prints or runs this matrix:
+
+```bash
+python finetuning/run_turn_detection_experiments.py \
+  --model_path Qwen/Qwen3-ASR-0.6B \
+  --train_file ./turn_train.jsonl \
+  --eval_file ./turn_dev.jsonl \
+  --test_file ./turn_test.jsonl \
+  --output_root ./turn_detection_experiments \
+  --seeds 42 43 44
+```
+
+Set `--execute 1` to actually run the commands.
+
+### 7) Generative baseline
+
+For a controlled comparison against the classifier-head route, this repository now also provides a separate generative baseline.
+
+The target is constrained to two plain text labels:
+
+- `complete`
+- `incomplete`
+
+Important design choices:
+
+- no tokenizer expansion
+- no `<complete>` / `<incomplete>` special tokens in v1
+- only the label tokens are supervised
+- prompt and audio formatting stay aligned with Qwen3-ASR chat-style inputs
+
+Example:
+
+```bash
+python finetuning/qwen3_turn_detection_generative.py \
+  --model_path Qwen/Qwen3-ASR-0.6B \
+  --train_file ./turn_train.jsonl \
+  --eval_file ./turn_dev.jsonl \
+  --output_dir ./qwen3-turn-detection-generative-out \
+  --batch_size 8 \
+  --grad_acc 2 \
+  --lr 5e-5 \
+  --epochs 3 \
+  --freeze_audio_tower 1 \
+  --freeze_text_model 1 \
+  --unfreeze_last_n_layers 4
+```
+
+### 8) Quick inference
 
 ```python
 import torch
@@ -151,7 +206,78 @@ result = detector.predict(
 print(result.label, result.complete_prob, result.incomplete_prob)
 ```
 
-### 8) Recommended system design
+For the generative baseline:
+
+```python
+import torch
+from qwen_asr.turn_detection import Qwen3GenerativeTurnDetector
+
+detector = Qwen3GenerativeTurnDetector.from_pretrained(
+    "./qwen3-turn-detection-generative-out/checkpoint-200",
+    dtype=torch.bfloat16,
+    device_map="cuda:0",
+)
+
+result = detector.predict(
+    audio="/data/dialog/utt001.wav",
+    cut_time_ms=2350,
+    left_context_ms=2000,
+    right_context_ms=600,
+    constrained_decode=True,
+)
+
+print(result.label, result.complete_prob, result.raw_text, result.first_token_margin)
+```
+
+### 9) Evaluation and threshold tuning
+
+Use the unified evaluation script for both routes:
+
+```bash
+python finetuning/eval_qwen3_turn_detection.py \
+  --mode classifier \
+  --model_path ./qwen3-turn-detection-out/checkpoint-200 \
+  --eval_file ./turn_dev.jsonl \
+  --test_file ./turn_test.jsonl \
+  --output_json ./turn_eval_report.json \
+  --predictions_jsonl ./turn_predictions.jsonl
+```
+
+For the generative baseline:
+
+```bash
+python finetuning/eval_qwen3_turn_detection.py \
+  --mode generative \
+  --model_path ./qwen3-turn-detection-generative-out/checkpoint-200 \
+  --eval_file ./turn_dev.jsonl \
+  --test_file ./turn_test.jsonl \
+  --output_json ./turn_eval_report_generative.json
+```
+
+The report includes:
+
+- `complete_precision`, `complete_recall`, `complete_f1`
+- AUROC / AUPRC
+- Brier score / ECE
+- tuned thresholds:
+  - default `0.5`
+  - high-precision threshold from dev
+  - balanced-F1 threshold from dev
+- latency summary
+- optional slice metrics when fields are present in the JSONL
+
+Recognized optional slice fields include:
+
+- `pause_ms` or `pause_duration_ms`
+- `utterance_type`
+- `language`
+- `speaking_rate`
+- `noise_level` or `snr_db`
+- `overlap_speech` / `has_overlap`
+- `tail_dragging` / related boolean aliases
+- `candidate_offset_ms` / `vad_offset_ms`
+
+### 10) Recommended system design
 
 Recommended serving stack:
 
