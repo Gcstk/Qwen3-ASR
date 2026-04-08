@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -78,6 +79,8 @@ def parse_args():
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--case_insensitive", type=int, default=1)
     p.add_argument("--group_by_fields", nargs="*", default=["gold_turn_label", "gold_language"])
+    p.add_argument("--measure_latency", type=int, default=1)
+    p.add_argument("--measure_ttft", type=int, default=1)
     return p.parse_args()
 
 
@@ -395,6 +398,127 @@ def safe_mean(values: Sequence[float]) -> Optional[float]:
     return float(sum(vals) / len(vals))
 
 
+def maybe_cuda_sync(model: Qwen3ASRModel) -> None:
+    if getattr(model, "backend", "") != "transformers":
+        return
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+
+def summarize_latency(values_ms: Sequence[Optional[float]]) -> Dict[str, Any]:
+    vals = [float(x) for x in values_ms if x is not None and not math.isnan(float(x))]
+    if not vals:
+        return {
+            "count": 0,
+            "mean_ms": None,
+            "p50_ms": None,
+            "p95_ms": None,
+            "min_ms": None,
+            "max_ms": None,
+        }
+    arr = np.asarray(vals, dtype=np.float64)
+    return {
+        "count": int(arr.size),
+        "mean_ms": float(arr.mean()),
+        "p50_ms": float(np.percentile(arr, 50)),
+        "p95_ms": float(np.percentile(arr, 95)),
+        "min_ms": float(arr.min()),
+        "max_ms": float(arr.max()),
+    }
+
+
+def _decode_generated_continuations(model: Qwen3ASRModel, sequences: torch.Tensor, input_len: int) -> List[str]:
+    return list(
+        model.processor.batch_decode(
+            sequences[:, input_len:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+    )
+
+
+def infer_asr_with_metrics(
+    model: Qwen3ASRModel,
+    contexts: List[str],
+    wavs: List[np.ndarray],
+    measure_latency: bool,
+    measure_ttft: bool,
+) -> Tuple[List[str], Dict[str, Any]]:
+    metrics: Dict[str, Any] = {
+        "backend": getattr(model, "backend", ""),
+        "batch_size": int(len(wavs)),
+        "batch_latency_ms": None,
+        "batch_ttft_ms": None,
+        "per_item_latency_ms": None,
+        "per_item_ttft_ms": None,
+        "generated_tokens_total": None,
+        "generated_tokens_per_item_mean": None,
+        "output_text_chars_total": None,
+        "tokens_per_second": None,
+        "ttft_supported": False,
+    }
+
+    if getattr(model, "backend", "") != "transformers":
+        if measure_latency:
+            maybe_cuda_sync(model)
+            start = time.perf_counter()
+            raw_outputs = model._infer_asr(contexts, wavs, [None] * len(wavs))
+            maybe_cuda_sync(model)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            metrics["batch_latency_ms"] = float(elapsed_ms)
+            metrics["per_item_latency_ms"] = float(elapsed_ms / max(1, len(wavs)))
+            metrics["output_text_chars_total"] = int(sum(len(str(x or "")) for x in raw_outputs))
+        else:
+            raw_outputs = model._infer_asr(contexts, wavs, [None] * len(wavs))
+        return raw_outputs, metrics
+
+    texts = [model._build_text_prompt(context=c, force_language=None) for c in contexts]
+    inputs = model.processor(text=texts, audio=wavs, return_tensors="pt", padding=True)
+    inputs = inputs.to(model.model.device).to(model.model.dtype)
+    input_len = int(inputs["input_ids"].shape[1])
+
+    if measure_ttft:
+        maybe_cuda_sync(model)
+        ttft_start = time.perf_counter()
+        _ = model.model.generate(**inputs, max_new_tokens=1)
+        maybe_cuda_sync(model)
+        ttft_ms = (time.perf_counter() - ttft_start) * 1000.0
+        metrics["batch_ttft_ms"] = float(ttft_ms)
+        metrics["per_item_ttft_ms"] = float(ttft_ms / max(1, len(wavs)))
+        metrics["ttft_supported"] = True
+
+    if measure_latency:
+        maybe_cuda_sync(model)
+        start = time.perf_counter()
+        outputs = model.model.generate(**inputs, max_new_tokens=model.max_new_tokens)
+        maybe_cuda_sync(model)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+    else:
+        outputs = model.model.generate(**inputs, max_new_tokens=model.max_new_tokens)
+        elapsed_ms = None
+
+    raw_outputs = _decode_generated_continuations(model, outputs.sequences, input_len=input_len)
+
+    generated_token_counts = (outputs.sequences.shape[1] - input_len)
+    generated_token_counts = [int(generated_token_counts)] * len(wavs)
+    total_gen_tokens = int(sum(generated_token_counts))
+
+    metrics["generated_tokens_total"] = total_gen_tokens
+    metrics["generated_tokens_per_item_mean"] = float(total_gen_tokens / max(1, len(wavs)))
+    metrics["output_text_chars_total"] = int(sum(len(str(x or "")) for x in raw_outputs))
+
+    if elapsed_ms is not None:
+        metrics["batch_latency_ms"] = float(elapsed_ms)
+        metrics["per_item_latency_ms"] = float(elapsed_ms / max(1, len(wavs)))
+        if elapsed_ms > 0:
+            metrics["tokens_per_second"] = float(total_gen_tokens / (elapsed_ms / 1000.0))
+
+    return raw_outputs, metrics
+
+
 def summarize_boolean_rate(records: List[Dict[str, Any]], key: str) -> float:
     vals = [1.0 if bool(row.get(key)) else 0.0 for row in records]
     return float(sum(vals) / max(1, len(vals)))
@@ -428,11 +552,31 @@ def build_group_summary(records: List[Dict[str, Any]], group_key: str, case_inse
 
 def evaluate_split(model: Qwen3ASRModel, records: List[Dict[str, Any]], args, split_name: str) -> Dict[str, Any]:
     enriched_records: List[Dict[str, Any]] = []
+    batch_latency_ms_values: List[Optional[float]] = []
+    batch_ttft_ms_values: List[Optional[float]] = []
+    per_item_latency_ms_values: List[Optional[float]] = []
+    per_item_ttft_ms_values: List[Optional[float]] = []
+    tokens_per_second_values: List[Optional[float]] = []
+    generated_tokens_total = 0
+    output_text_chars_total = 0
 
     for batch in batched(records, max(1, int(args.batch_size))):
         wavs = normalize_audios([row["audio"] for row in batch])
         contexts = [str(row.get("prompt", "") or "") for row in batch]
-        raw_outputs = model._infer_asr(contexts, wavs, [None] * len(batch))
+        raw_outputs, timing = infer_asr_with_metrics(
+            model,
+            contexts=contexts,
+            wavs=wavs,
+            measure_latency=bool(args.measure_latency),
+            measure_ttft=bool(args.measure_ttft),
+        )
+        batch_latency_ms_values.append(timing.get("batch_latency_ms"))
+        batch_ttft_ms_values.append(timing.get("batch_ttft_ms"))
+        per_item_latency_ms_values.append(timing.get("per_item_latency_ms"))
+        per_item_ttft_ms_values.append(timing.get("per_item_ttft_ms"))
+        tokens_per_second_values.append(timing.get("tokens_per_second"))
+        generated_tokens_total += int(timing.get("generated_tokens_total") or 0)
+        output_text_chars_total += int(timing.get("output_text_chars_total") or 0)
 
         for row, raw_out in zip(batch, raw_outputs):
             gold = parse_gold_row(row, label_position=args.label_position)
@@ -474,6 +618,8 @@ def evaluate_split(model: Qwen3ASRModel, records: List[Dict[str, Any]], args, sp
                     "pred_has_label_token": bool(pred.has_label_token),
                     "pred_soft_parse_success": bool(pred.soft_parse_success),
                     "pred_strict_schema_valid": bool(pred.strict_schema_valid),
+                    "latency_ms": timing.get("per_item_latency_ms"),
+                    "ttft_ms": timing.get("per_item_ttft_ms"),
                     "label_match": bool(label_match),
                     "language_match": bool(language_match),
                     "transcript_exact_match": bool(text_match),
@@ -535,6 +681,20 @@ def evaluate_split(model: Qwen3ASRModel, records: List[Dict[str, Any]], args, sp
                 enriched_records,
                 "joint_language_label_text_exact_match",
             ),
+        },
+        "latency": {
+            "backend": getattr(model, "backend", ""),
+            "latency_enabled": bool(args.measure_latency),
+            "ttft_enabled": bool(args.measure_ttft),
+            "batch_latency_ms": summarize_latency(batch_latency_ms_values),
+            "per_item_latency_ms": summarize_latency(per_item_latency_ms_values),
+            "batch_ttft_ms": summarize_latency(batch_ttft_ms_values),
+            "per_item_ttft_ms": summarize_latency(per_item_ttft_ms_values),
+            "tokens_per_second": {
+                "mean": safe_mean(tokens_per_second_values),
+            },
+            "generated_tokens_total": int(generated_tokens_total),
+            "output_text_chars_total": int(output_text_chars_total),
         },
         "subsets": {
             "valid_schema_count": int(len(valid_records)),
