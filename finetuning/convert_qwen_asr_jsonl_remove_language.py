@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from tqdm import tqdm
+
 
 DEFAULT_PROMPT_NO_LANGUAGE = (
     "请转录音频内容，并严格使用格式：<turn_state><标签><asr_text>转写文本。"
@@ -116,8 +118,14 @@ def main():
         f"prompt_strategy={args.prompt_strategy}"
     )
 
+    with open(input_jsonl, "r", encoding="utf-8") as fin:
+        total_lines = sum(1 for line in fin if line.strip())
+
     with open(input_jsonl, "r", encoding="utf-8") as fin, open(output_jsonl, "w", encoding="utf-8") as fout:
-        for line_no, line in enumerate(fin, start=1):
+        for line_no, line in enumerate(
+            tqdm(fin, total=total_lines, desc="Removing language", unit="record"),
+            start=1,
+        ):
             text = line.strip()
             if not text:
                 continue
