@@ -22,6 +22,7 @@ from .qwen3_turn_detector import (
     TurnDetectorPrediction,
     _slice_candidate_window,
     build_turn_detection_prompt_text,
+    normalize_turn_detector_batch_inputs,
 )
 
 
@@ -145,14 +146,13 @@ class Qwen3GenerativeTurnDetector:
         right_context_ms: Optional[Union[float, List[float]]] = None,
         prompt: Optional[Union[str, List[str]]] = None,
     ) -> Tuple[List[np.ndarray], List[str]]:
-        audios = audio if isinstance(audio, list) else [audio]
-        cut_list = cut_time_ms if isinstance(cut_time_ms, list) else [cut_time_ms] * len(audios)
-        left_list = left_context_ms if isinstance(left_context_ms, list) else [left_context_ms] * len(audios)
-        right_list = right_context_ms if isinstance(right_context_ms, list) else [right_context_ms] * len(audios)
-        prompt_list = prompt if isinstance(prompt, list) else [prompt] * len(audios)
-
-        if not (len(audios) == len(cut_list) == len(left_list) == len(right_list) == len(prompt_list)):
-            raise ValueError("Batch size mismatch in audio/cut/prompt inputs")
+        audios, cut_list, left_list, right_list, prompt_list = normalize_turn_detector_batch_inputs(
+            audio=audio,
+            cut_time_ms=cut_time_ms,
+            left_context_ms=left_context_ms,
+            right_context_ms=right_context_ms,
+            prompt=prompt,
+        )
 
         wavs: List[np.ndarray] = []
         prompt_texts: List[str] = []
@@ -329,7 +329,7 @@ class Qwen3GenerativeTurnDetector:
         }
 
     @torch.no_grad()
-    def predict_batch(
+    def _predict_batch_impl(
         self,
         audio: Union[AudioLike, List[AudioLike]],
         cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
@@ -338,6 +338,7 @@ class Qwen3GenerativeTurnDetector:
         prompt: Optional[Union[str, List[str]]] = None,
         constrained_decode: bool = True,
     ) -> List[GenerativeTurnDetectorPrediction]:
+        total_start = time.perf_counter()
         wavs, prompt_texts = self._prepare_audio_batch(
             audio=audio,
             cut_time_ms=cut_time_ms,
@@ -364,7 +365,17 @@ class Qwen3GenerativeTurnDetector:
                 base_input_len=base_input_len,
             )
 
-        start = time.perf_counter()
+        ttft_start = time.perf_counter()
+        self.model.generate(
+            **inputs,
+            max_new_tokens=1,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            return_dict_in_generate=False,
+            output_scores=False,
+        )
+        ttft_elapsed_ms = (time.perf_counter() - ttft_start) * 1000.0
+
+        generation_start = time.perf_counter()
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=self.max_new_tokens,
@@ -372,7 +383,7 @@ class Qwen3GenerativeTurnDetector:
             return_dict_in_generate=True,
             output_scores=True,
         )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        generation_elapsed_ms = (time.perf_counter() - generation_start) * 1000.0
 
         generated_ids = outputs.sequences[:, base_input_len:]
         decoded = self.processor.batch_decode(
@@ -392,6 +403,7 @@ class Qwen3GenerativeTurnDetector:
             right_context_ms=right_context_ms,
             prompt=prompt,
         )
+        total_elapsed_ms = (time.perf_counter() - total_start) * 1000.0
 
         predictions: List[GenerativeTurnDetectorPrediction] = []
         for idx, raw_text in enumerate(decoded):
@@ -422,10 +434,61 @@ class Qwen3GenerativeTurnDetector:
             )
 
         if predictions:
-            per_item_ms = elapsed_ms / len(predictions)
+            per_item_latency_ms = generation_elapsed_ms / len(predictions)
+            per_item_ttft_ms = ttft_elapsed_ms / len(predictions)
+            per_item_full_ms = total_elapsed_ms / len(predictions)
             for pred in predictions:
-                pred.latency_ms = per_item_ms
+                pred.latency_ms = per_item_latency_ms
+                pred.ttft_ms = per_item_ttft_ms
+                pred.full_inference_ms = per_item_full_ms
         return predictions
+
+    @torch.no_grad()
+    def predict_batch(
+        self,
+        audio: Union[AudioLike, List[AudioLike]],
+        cut_time_ms: Optional[Union[float, List[Optional[float]]]] = None,
+        left_context_ms: Optional[Union[float, List[float]]] = None,
+        right_context_ms: Optional[Union[float, List[float]]] = None,
+        prompt: Optional[Union[str, List[str]]] = None,
+        constrained_decode: bool = True,
+        measure_timings_per_sample: bool = False,
+    ) -> List[GenerativeTurnDetectorPrediction]:
+        audios, cut_list, left_list, right_list, prompt_list = normalize_turn_detector_batch_inputs(
+            audio=audio,
+            cut_time_ms=cut_time_ms,
+            left_context_ms=left_context_ms,
+            right_context_ms=right_context_ms,
+            prompt=prompt,
+        )
+        if measure_timings_per_sample and len(audios) > 1:
+            predictions: List[GenerativeTurnDetectorPrediction] = []
+            for audio_item, cut_ms, left_ms, right_ms, prompt_item in zip(
+                audios,
+                cut_list,
+                left_list,
+                right_list,
+                prompt_list,
+            ):
+                predictions.extend(
+                    self._predict_batch_impl(
+                        audio=[audio_item],
+                        cut_time_ms=[cut_ms],
+                        left_context_ms=[left_ms],
+                        right_context_ms=[right_ms],
+                        prompt=[prompt_item],
+                        constrained_decode=constrained_decode,
+                    )
+                )
+            return predictions
+        return self._predict_batch_impl(
+            audio=audios,
+            cut_time_ms=cut_list,
+            left_context_ms=left_list,
+            right_context_ms=right_list,
+            prompt=prompt_list,
+            constrained_decode=constrained_decode,
+        )
 
     @torch.no_grad()
     def predict(
@@ -444,4 +507,5 @@ class Qwen3GenerativeTurnDetector:
             right_context_ms=[right_context_ms],
             prompt=[prompt],
             constrained_decode=constrained_decode,
+            measure_timings_per_sample=True,
         )[0]

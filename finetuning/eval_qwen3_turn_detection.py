@@ -89,6 +89,8 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
     y_true: List[int] = []
     complete_prob: List[float] = []
     latencies: List[float] = []
+    ttfts: List[float] = []
+    full_inference_latencies: List[float] = []
     first_token_margin: List[float] = []
     exact_match: List[float] = []
     enriched_records: List[Dict[str, Any]] = []
@@ -108,6 +110,7 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
                 right_context_ms=right_context_ms,
                 prompt=prompts,
                 threshold=0.5,
+                measure_timings_per_sample=True,
             )
         else:
             predictions = model.predict_batch(
@@ -117,6 +120,7 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
                 right_context_ms=right_context_ms,
                 prompt=prompts,
                 constrained_decode=bool(args.constrained_decode),
+                measure_timings_per_sample=True,
             )
 
         for row, pred in zip(batch, predictions):
@@ -127,6 +131,10 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
             complete_prob.append(float(pred.complete_prob))
             if pred.latency_ms is not None:
                 latencies.append(float(pred.latency_ms))
+            if getattr(pred, "ttft_ms", None) is not None:
+                ttfts.append(float(pred.ttft_ms))
+            if getattr(pred, "full_inference_ms", None) is not None:
+                full_inference_latencies.append(float(pred.full_inference_ms))
             if getattr(pred, "first_token_margin", None) is not None:
                 first_token_margin.append(float(pred.first_token_margin))
             if getattr(pred, "exact_match", None) is not None:
@@ -142,6 +150,8 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
                     "complete_prob": float(pred.complete_prob),
                     "incomplete_prob": float(pred.incomplete_prob),
                     "latency_ms": finite_or_none(pred.latency_ms),
+                    "ttft_ms": finite_or_none(getattr(pred, "ttft_ms", None)),
+                    "full_inference_ms": finite_or_none(getattr(pred, "full_inference_ms", None)),
                 }
             )
             if getattr(pred, "raw_text", None) is not None:
@@ -162,6 +172,8 @@ def evaluate_split(model, records: List[Dict[str, Any]], args, split_name: str) 
         target_precision=float(args.target_complete_precision),
     )
     summary["latency"] = latency_summary(latencies)
+    summary["ttft"] = latency_summary(ttfts)
+    summary["full_inference"] = latency_summary(full_inference_latencies)
     if first_token_margin:
         summary["first_token_margin"] = {
             "mean": float(np.mean(first_token_margin)),
