@@ -18,11 +18,11 @@ def _load_module(module_name: str, relative_path: str):
 
 _TRAIN_CONVERTER = _load_module(
     "convert_easy_turn_to_qwen_asr_jsonl",
-    "finetuning/convert_easy_turn_to_qwen_asr_jsonl.py",
+    "finetuning/utils/convert_easy_turn_to_qwen_asr_jsonl.py",
 )
 _POSTPROCESS = _load_module(
     "convert_qwen_asr_jsonl_remove_language",
-    "finetuning/convert_qwen_asr_jsonl_remove_language.py",
+    "finetuning/utils/convert_qwen_asr_jsonl_remove_language.py",
 )
 
 

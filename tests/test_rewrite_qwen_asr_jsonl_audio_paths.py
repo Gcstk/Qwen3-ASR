@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 _ROOT = Path(__file__).resolve().parents[1]
-_SCRIPT_PATH = _ROOT / "finetuning" / "rewrite_qwen_asr_jsonl_audio_paths.py"
+_SCRIPT_PATH = _ROOT / "finetuning" / "utils" / "rewrite_qwen_asr_jsonl_audio_paths.py"
 _SPEC = importlib.util.spec_from_file_location("rewrite_qwen_asr_jsonl_audio_paths", _SCRIPT_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC is not None and _SPEC.loader is not None

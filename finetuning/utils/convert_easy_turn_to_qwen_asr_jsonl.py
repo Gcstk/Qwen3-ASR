@@ -26,7 +26,7 @@
 # turn-taking / control-token experiments.
 #
 # Typical usage:
-#   python finetuning/convert_easy_turn_to_qwen_asr_jsonl.py \
+#   python finetuning/utils/convert_easy_turn_to_qwen_asr_jsonl.py \
 #       --shards_list /path/to/shards_list.txt \
 #       --output_jsonl /path/to/easy_turn_train.jsonl \
 #       --audio_dir /path/to/extracted_audio \

@@ -10,7 +10,7 @@
 #   key  subset  label  transcript  tagged_text  task  wav  source_list
 #
 # Typical usage:
-#   python finetuning/convert_easy_turn_testset_to_qwen_asr_jsonl.py \
+#   python finetuning/utils/convert_easy_turn_testset_to_qwen_asr_jsonl.py \
 #       --input_tsv /path/to/Easy-Turn-Testset/testset/all_labels.tsv \
 #       --output_jsonl /path/to/easy_turn_test_qwen_asr.jsonl \
 #       --dataset_root /path/to/Easy-Turn-Testset/testset \
