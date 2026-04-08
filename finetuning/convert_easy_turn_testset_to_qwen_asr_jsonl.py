@@ -53,7 +53,24 @@ PROMPT_TEMPLATE_POOL = [
     "请对音频进行文字转录，并使用固定协议输出：language 语种<turn_state><标签><asr_text>文本。四种标签含义为：<complete> 代表语义完整，<incomplete> 代表语义不完整，<backchannel> 代表简短附和，<wait> 代表请求暂停或终止交流。",
 ]
 
-DEFAULT_FIXED_PROMPT = PROMPT_TEMPLATE_POOL[0]
+PROMPT_TEMPLATE_POOL_NO_LANGUAGE = [
+    "请转录音频内容，并严格使用格式：<turn_state><标签><asr_text>转写文本。其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，<wait> 表示请求暂停或终止对话。",
+    "请将音频转写为文本，并按固定格式输出：<turn_state><标签><asr_text>文本。标签含义为：<complete>（语义完整）、<incomplete>（语义不完整）、<backchannel>（附和语句）、<wait>（请求暂停或终止对话）。",
+    "请先判断轮次状态并转录音频内容，输出格式必须为：<turn_state><标签><asr_text>文本。其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，<wait> 表示请求暂停或终止对话。",
+    "请将音频内容转换为文字，并严格输出为：<turn_state><标签><asr_text>文本。标签说明：<complete>（语义完整）、<incomplete>（语义不完整）、<backchannel>（反馈信号）、<wait>（表示希望暂停或结束对话）。",
+    "请对音频进行文字转录，并使用固定协议输出：<turn_state><标签><asr_text>文本。四种标签含义为：<complete> 代表语义完整，<incomplete> 代表语义不完整，<backchannel> 代表简短附和，<wait> 代表请求暂停或终止交流。",
+]
+
+DEFAULT_FIXED_PROMPT_WITH_LANGUAGE = (
+    "请转录音频内容，并严格使用格式：language 语种<turn_state><标签><asr_text>转写文本。"
+    "其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，"
+    "<wait> 表示请求暂停或终止对话。"
+)
+DEFAULT_FIXED_PROMPT_NO_LANGUAGE = (
+    "请转录音频内容，并严格使用格式：<turn_state><标签><asr_text>转写文本。"
+    "其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，"
+    "<wait> 表示请求暂停或终止对话。"
+)
 
 
 def parse_args():
@@ -151,10 +168,21 @@ def parse_args():
     p.add_argument(
         "--fixed_prompt",
         type=str,
-        default=DEFAULT_FIXED_PROMPT,
+        default="",
         help=(
             "Fixed prompt string used when --prompt_mode fixed. The default value is the "
-            "first recommended prompt template from the turn-taking plan."
+            "recommended prompt template for the selected predict_language setting."
+        ),
+    )
+    p.add_argument(
+        "--predict_language",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "Whether the generated target text and prompt should require explicit language "
+            "prediction. `0` removes the `language {LANG}` prefix from targets and uses "
+            "language-free prompt templates. `1` keeps the original language-prediction setup."
         ),
     )
     p.add_argument(
@@ -296,23 +324,35 @@ def parse_label(
     return None, None
 
 
-def build_qwen_asr_target(lang_name: str, transcript: str, label: Optional[str], output_format: str) -> str:
+def build_qwen_asr_target(
+    lang_name: str,
+    transcript: str,
+    label: Optional[str],
+    output_format: str,
+    predict_language: bool,
+) -> str:
     if output_format == "plain_asr" or not label:
-        return f"language {lang_name}<asr_text>{transcript}"
+        prefix = f"language {lang_name}" if predict_language else ""
+        return f"{prefix}<asr_text>{transcript}"
 
     label_token = f"<{label}>"
     if output_format == "label_last":
-        return f"language {lang_name}<asr_text>{transcript}{label_token}"
-    return f"language {lang_name}<turn_state>{label_token}<asr_text>{transcript}"
+        prefix = f"language {lang_name}" if predict_language else ""
+        return f"{prefix}<asr_text>{transcript}{label_token}"
+    prefix = f"language {lang_name}" if predict_language else ""
+    return f"{prefix}<turn_state>{label_token}<asr_text>{transcript}"
 
 
-def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str) -> str:
+def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str, predict_language: bool) -> str:
     if prompt_mode == "empty":
         return ""
     if prompt_mode == "fixed":
-        return fixed_prompt or ""
+        if fixed_prompt:
+            return fixed_prompt
+        return DEFAULT_FIXED_PROMPT_WITH_LANGUAGE if predict_language else DEFAULT_FIXED_PROMPT_NO_LANGUAGE
     if prompt_mode == "template_pool":
-        return random.choice(PROMPT_TEMPLATE_POOL)
+        pool = PROMPT_TEMPLATE_POOL if predict_language else PROMPT_TEMPLATE_POOL_NO_LANGUAGE
+        return random.choice(pool)
 
     tokens = parse_task_tokens(task_text)
     if tokens:
@@ -320,9 +360,20 @@ def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str) -> str:
         return (
             f"Easy-Turn task specification: {task_desc}. "
             "Transcribe the speech and produce the reference text exactly. "
-            "Keep the output format consistent with the instruction."
+            + (
+                "Use the exact output format `language <lang><turn_state><label><asr_text><text>`."
+                if predict_language
+                else "Use the exact output format `<turn_state><label><asr_text><text>`."
+            )
         )
-    return "Transcribe the speech and produce the reference text exactly."
+    return (
+        "Transcribe the speech and produce the reference text exactly. "
+        + (
+            "Use the exact output format `language <lang><turn_state><label><asr_text><text>`."
+            if predict_language
+            else "Use the exact output format `<turn_state><label><asr_text><text>`."
+        )
+    )
 
 
 def resolve_audio_path(raw_wav: str, dataset_root: Path) -> Path:
@@ -363,7 +414,7 @@ def infer_transcript(raw_transcript: str, tagged_text: str, keep_inline_tags: bo
 
 def main():
     args = parse_args()
-    if args.prompt_mode == "fixed" and not args.fixed_prompt.strip():
+    if args.prompt_mode == "fixed" and args.fixed_prompt and not args.fixed_prompt.strip():
         raise ValueError("--prompt_mode fixed requires a non-empty --fixed_prompt.")
     if args.copy_audio == 1 and not args.audio_dir.strip():
         raise ValueError("--copy_audio 1 requires --audio_dir.")
@@ -484,8 +535,19 @@ def main():
                 shutil.copy2(str(audio_src_path), str(copied_audio_path))
                 final_audio_path = copied_audio_path
 
-            prompt = build_prompt(raw_task, args.prompt_mode, args.fixed_prompt)
-            target_text = build_qwen_asr_target(args.default_lang, transcript, label, args.output_format)
+            prompt = build_prompt(
+                raw_task,
+                args.prompt_mode,
+                args.fixed_prompt,
+                bool(args.predict_language),
+            )
+            target_text = build_qwen_asr_target(
+                args.default_lang,
+                transcript,
+                label,
+                args.output_format,
+                bool(args.predict_language),
+            )
 
             record = {
                 "audio": audio_path_for_manifest(final_audio_path, output_jsonl, args.audio_path_mode),
@@ -505,6 +567,7 @@ def main():
                 "easy_turn_source_list": raw_source_list.strip(),
                 "easy_turn_default_lang": args.default_lang,
                 "output_format": args.output_format,
+                "predict_language": int(args.predict_language),
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             num_written += 1
@@ -533,6 +596,7 @@ def main():
                 "prompt_mode": args.prompt_mode,
                 "output_format": args.output_format,
                 "audio_path_mode": args.audio_path_mode,
+                "predict_language": int(args.predict_language),
                 "elapsed_seconds": round(total_elapsed, 3),
             },
             ensure_ascii=False,

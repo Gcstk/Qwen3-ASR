@@ -104,6 +104,26 @@ PROMPT_TEMPLATE_POOL = [
     "请对音频进行文字转录，并使用固定协议输出：language 语种<turn_state><标签><asr_text>文本。四种标签含义为：<complete> 代表语义完整，<incomplete> 代表语义不完整，<backchannel> 代表简短附和，<wait> 代表请求暂停或终止交流。",
 ]
 
+PROMPT_TEMPLATE_POOL_NO_LANGUAGE = [
+    "请转录音频内容，并严格使用格式：<turn_state><标签><asr_text>转写文本。其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，<wait> 表示请求暂停或终止对话。",
+    "请将音频转写为文本，并按固定格式输出：<turn_state><标签><asr_text>文本。标签含义为：<complete>（语义完整）、<incomplete>（语义不完整）、<backchannel>（附和语句）、<wait>（请求暂停或终止对话）。",
+    "请先判断轮次状态并转录音频内容，输出格式必须为：<turn_state><标签><asr_text>文本。其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，<wait> 表示请求暂停或终止对话。",
+    "请将音频内容转换为文字，并严格输出为：<turn_state><标签><asr_text>文本。标签说明：<complete>（语义完整）、<incomplete>（语义不完整）、<backchannel>（反馈信号）、<wait>（表示希望暂停或结束对话）。",
+    "请对音频进行文字转录，并使用固定协议输出：<turn_state><标签><asr_text>文本。四种标签含义为：<complete> 代表语义完整，<incomplete> 代表语义不完整，<backchannel> 代表简短附和，<wait> 代表请求暂停或终止交流。",
+]
+
+DEFAULT_FIXED_PROMPT_WITH_LANGUAGE = (
+    "请转录音频内容，并严格使用格式：language 语种<turn_state><标签><asr_text>转写文本。"
+    "其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，"
+    "<wait> 表示请求暂停或终止对话。"
+)
+
+DEFAULT_FIXED_PROMPT_NO_LANGUAGE = (
+    "请转录音频内容，并严格使用格式：<turn_state><标签><asr_text>转写文本。"
+    "其中 <complete> 表示语义完整，<incomplete> 表示语义不完整，<backchannel> 表示简短附和，"
+    "<wait> 表示请求暂停或终止对话。"
+)
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -182,6 +202,17 @@ def parse_args():
         help=(
             "Fixed prompt string used only when --prompt_mode fixed. This is useful when "
             "you want all samples in one split to share the exact same instruction."
+        ),
+    )
+    p.add_argument(
+        "--predict_language",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "Whether the generated target text and prompt should require explicit language "
+            "prediction. `0` removes the `language {LANG}` prefix from targets and uses "
+            "language-free prompt templates. `1` keeps the original language-prediction setup."
         ),
     )
     p.add_argument(
@@ -366,7 +397,13 @@ def parse_label_from_task(raw_task: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def build_qwen_asr_target(lang_name: str, transcript: str, label: Optional[str], output_format: str) -> str:
+def build_qwen_asr_target(
+    lang_name: str,
+    transcript: str,
+    label: Optional[str],
+    output_format: str,
+    predict_language: bool,
+) -> str:
     """
     Build the final supervision text consumed by Qwen3-ASR SFT.
 
@@ -381,13 +418,14 @@ def build_qwen_asr_target(lang_name: str, transcript: str, label: Optional[str],
     `label_first` is the recommended default for the current turn-taking plan
     because it keeps the turn-state protocol explicit and stable.
     """
+    prefix = f"language {lang_name}" if predict_language else ""
     if output_format == "plain_asr" or not label:
-        return f"language {lang_name}<asr_text>{transcript}"
+        return f"{prefix}<asr_text>{transcript}"
 
     label_token = f"<{label}>"
     if output_format == "label_last":
-        return f"language {lang_name}<asr_text>{transcript}{label_token}"
-    return f"language {lang_name}<turn_state>{label_token}<asr_text>{transcript}"
+        return f"{prefix}<asr_text>{transcript}{label_token}"
+    return f"{prefix}<turn_state>{label_token}<asr_text>{transcript}"
 
 
 def parse_task_tokens(task_text: str) -> List[str]:
@@ -395,7 +433,7 @@ def parse_task_tokens(task_text: str) -> List[str]:
     return _TASK_TOKEN_RE.findall(task_text or "")
 
 
-def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str) -> str:
+def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str, predict_language: bool) -> str:
     """
     Build the training prompt for one sample.
 
@@ -415,21 +453,34 @@ def build_prompt(task_text: str, prompt_mode: str, fixed_prompt: str) -> str:
     if prompt_mode == "empty":
         return ""
     if prompt_mode == "fixed":
-        return fixed_prompt or ""
+        if fixed_prompt:
+            return fixed_prompt
+        return DEFAULT_FIXED_PROMPT_WITH_LANGUAGE if predict_language else DEFAULT_FIXED_PROMPT_NO_LANGUAGE
     if prompt_mode == "template_pool":
-        return random.choice(PROMPT_TEMPLATE_POOL)
+        pool = PROMPT_TEMPLATE_POOL if predict_language else PROMPT_TEMPLATE_POOL_NO_LANGUAGE
+        return random.choice(pool)
 
     tokens = parse_task_tokens(task_text)
     if tokens:
         task_desc = " ".join(tokens)
+        format_hint = (
+            "Use the exact output format `language <lang><turn_state><label><asr_text><text>`."
+            if predict_language
+            else "Use the exact output format `<turn_state><label><asr_text><text>`."
+        )
         return (
             f"Easy-Turn task specification: {task_desc}. "
             "Transcribe the speech and produce the reference text exactly. "
-            "Keep any inline control tags in the target text unchanged."
+            f"{format_hint} Keep any inline control tags in the target text unchanged."
         )
     return (
         "Transcribe the speech and produce the reference text exactly. "
-        "Keep any inline control tags in the target text unchanged."
+        + (
+            "Use the exact output format `language <lang><turn_state><label><asr_text><text>`. "
+            if predict_language
+            else "Use the exact output format `<turn_state><label><asr_text><text>`. "
+        )
+        + "Keep any inline control tags in the target text unchanged."
     )
 
 
@@ -545,7 +596,7 @@ def format_seconds(seconds: float) -> str:
 
 def main():
     args = parse_args()
-    if args.prompt_mode == "fixed" and not args.fixed_prompt.strip():
+    if args.prompt_mode == "fixed" and args.fixed_prompt and not args.fixed_prompt.strip():
         raise ValueError(
             "--prompt_mode fixed requires a non-empty --fixed_prompt. "
             "Either provide an explicit prompt string or switch to "
@@ -671,11 +722,13 @@ def main():
                     transcript=target_transcript,
                     label=label,
                     output_format=args.output_format,
+                    predict_language=bool(args.predict_language),
                 )
                 prompt = build_prompt(
                     raw_task,
                     prompt_mode=args.prompt_mode,
                     fixed_prompt=args.fixed_prompt,
+                    predict_language=bool(args.predict_language),
                 )
 
                 audio_out_path = ensure_unique_output_name(audio_dir, sample_id, "wav", used_names)
@@ -699,6 +752,7 @@ def main():
                     "easy_turn_label": label,
                     "easy_turn_label_token": label_token,
                     "output_format": args.output_format,
+                    "predict_language": int(args.predict_language),
                 }
 
                 for meta_key in ("duration", "emotion", "extra", "gender", "speaker", "state"):
@@ -739,6 +793,7 @@ def main():
                 "prompt_mode": args.prompt_mode,
                 "audio_path_mode": args.audio_path_mode,
                 "output_format": args.output_format,
+                "predict_language": int(args.predict_language),
                 "log_every": args.log_every,
                 "elapsed_seconds": round(total_elapsed, 3),
             },
