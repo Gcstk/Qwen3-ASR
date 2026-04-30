@@ -5,6 +5,18 @@ For a Chinese walkthrough focused on training code, model flow, `transformers.Tr
 
 For turn detection built on top of Qwen3-ASR hidden states, see [TURN_DETECTION.md](TURN_DETECTION.md).
 
+### Layout
+
+- Training and evaluation entrypoints stay directly under `finetuning/`
+- Dataset conversion and manifest maintenance utilities live under `finetuning/utils/`
+
+Common utility scripts:
+
+- `python finetuning/utils/convert_easy_turn_to_qwen_asr_jsonl.py ...`
+- `python finetuning/utils/convert_easy_turn_testset_to_qwen_asr_jsonl.py ...`
+- `python finetuning/utils/convert_qwen_asr_jsonl_remove_language.py ...`
+- `python finetuning/utils/rewrite_qwen_asr_jsonl_audio_paths.py ...`
+
 ### 1) Setup
 
 First, please install the two Python packages `qwen-asr` and `datasets` using the command below.

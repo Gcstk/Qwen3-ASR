@@ -8,10 +8,16 @@ from .qwen3_turn_detector import (
     Qwen3TurnDetector,
     TurnDetectorPrediction,
 )
+from .qwen3_generative_turn_detector import (
+    Qwen3GenerativeTurnDetector,
+    GenerativeTurnDetectorPrediction,
+)
 
 __all__ = [
     "DEFAULT_TURN_DETECTION_PROMPT",
     "TURN_LABELS",
     "Qwen3TurnDetector",
     "TurnDetectorPrediction",
+    "Qwen3GenerativeTurnDetector",
+    "GenerativeTurnDetectorPrediction",
 ]

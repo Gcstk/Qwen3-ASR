@@ -103,6 +103,11 @@ from ..transformers_backend.configuration_qwen3_asr import (
 from ..transformers_backend.processing_qwen3_asr import (
     Qwen3ASRProcessor,
 )
+from ...inference.utils import (
+    build_vllm_transcription_prompt,
+    parse_joint_output,
+    post_process_vllm_transcription_output,
+)
 
 try:
     from vllm.multimodal.profiling import BaseDummyInputsBuilder
@@ -978,16 +983,11 @@ class Qwen3ASRForConditionalGeneration(
                 "Supported task types are 'transcribe' and 'translate'."
             )
         full_lang_name_to = cls.supported_languages.get(to_language, to_language)
-        if to_language is None:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-        else:
-            prompt = (
-                f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
-                f"<|im_start|>assistant\nlanguage {full_lang_name_to}<asr_text>"
-            )
+        prompt = build_vllm_transcription_prompt(
+            audio_placeholder=audio_placeholder,
+            request_prompt=request_prompt,
+            to_language=full_lang_name_to,
+        )
 
         prompt_token_ids = tokenizer.encode(prompt)
         prompt_dict = {
@@ -995,3 +995,26 @@ class Qwen3ASRForConditionalGeneration(
             "multi_modal_data": {"audio": audio},
         }
         return cast(PromptType, prompt_dict)
+
+    @classmethod
+    def post_process_output(cls, text: str) -> str:
+        raw_text = str(text or "").strip()
+        processed_text = post_process_vllm_transcription_output(raw_text)
+
+        if "<asr_text>" in raw_text:
+            parsed = parse_joint_output(raw_text, label_position="auto")
+            if parsed.has_turn_state_tag and parsed.has_label_token:
+                logger.info(
+                    "Qwen3-ASR post_process_output: preserving structured joint output "
+                    "(language=%s, turn_label=%s, transcript_chars=%d)",
+                    parsed.language or "",
+                    parsed.turn_label or "",
+                    len(parsed.transcript),
+                )
+            elif processed_text != raw_text:
+                logger.info(
+                    "Qwen3-ASR post_process_output: trimming plain ASR prefix and "
+                    "returning transcript only"
+                )
+
+        return processed_text

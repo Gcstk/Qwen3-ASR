@@ -1,44 +1,64 @@
 # coding=utf-8
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
-"""
-基于 Qwen3-ASR 底座做 turn detection（二分类）的训练脚本。
-
-和 ASR SFT 脚本相比，这里最大的区别是：
-- 不再训练生成文本；
-- 而是把 Qwen3-ASR 当作音频-文本 backbone，最后接一个分类头；
-- 标签只预测 `complete / incomplete`。
-
-如果你是 Transformers 新手，可以这样理解：
-1. Dataset 先提供音频、候选切点和标签；
-2. Collator 把音频裁成窗口并编码；
-3. 模型前向得到 logits；
-4. Trainer 负责反向传播、保存 checkpoint、评估指标。
-"""
 import argparse
+import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import librosa
-import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import EarlyStoppingCallback, Trainer, TrainerCallback, TrainingArguments, set_seed
+from transformers import EarlyStoppingCallback, GenerationConfig, Trainer, TrainerCallback, TrainingArguments, set_seed
 
-from qwen_asr.turn_detection import DEFAULT_TURN_DETECTION_PROMPT, Qwen3TurnDetector
-from qwen_asr.turn_detection.metrics import summarize_binary_classification
-from qwen_asr.turn_detection.qwen3_turn_detector import (
+from qwen_asr.turn_detection import (
+    DEFAULT_TURN_DETECTION_PROMPT,
+    Qwen3GenerativeTurnDetector,
     TURN_LABELS,
-    build_turn_detection_prompt_text,
 )
+from qwen_asr.turn_detection.qwen3_turn_detector import build_turn_detection_prompt_text
+
+
+def patch_outer_forward(model):
+    cls = model.__class__
+    if getattr(cls, "_forward_patched", False):
+        return
+
+    if not hasattr(model, "thinker") or not hasattr(model.thinker, "forward"):
+        raise RuntimeError(
+            "Cannot patch forward: model has no `.thinker.forward`. "
+            "Your qwen3_asr model may be incompatible."
+        )
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        input_features=None,
+        feature_attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        return self.thinker.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            labels=labels,
+            **kwargs,
+        )
+
+    cls.forward = forward
+    cls._forward_patched = True
+
 
 _CKPT_RE = re.compile(r"^checkpoint-(\d+)$")
 
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
-    """用于 `--resume 1` 自动恢复训练。"""
     if not output_dir or not os.path.isdir(output_dir):
         return None
     best_step = None
@@ -55,26 +75,25 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return best_path
 
 
+def normalize_label(label: str) -> str:
+    s = str(label).strip().lower()
+    if s not in TURN_LABELS:
+        raise ValueError(f"Unsupported label={label!r}. Supported labels: {TURN_LABELS}")
+    return s
+
+
 def load_audio(path: str, sr: int = 16000):
-    """统一读成 16k 单声道。"""
     wav, _ = librosa.load(path, sr=sr, mono=True)
     return wav
 
 
 def slice_candidate_window(
-    wav: np.ndarray,
+    wav,
     sr: int,
     cut_time_ms: Optional[float],
     left_context_ms: float,
     right_context_ms: float,
-) -> np.ndarray:
-    """
-    围绕候选结束点裁出训练窗口。
-
-    这里体现了当前 turn detection 的任务定义：
-    - 不是拿整段会话做分类；
-    - 而是围绕某个 VAD 给出的候选结束点，看这是不是“真的说完了”。
-    """
+):
     if cut_time_ms is None:
         return wav
     cut_sample = int(round(float(cut_time_ms) * sr / 1000.0))
@@ -87,28 +106,14 @@ def slice_candidate_window(
     return wav[start:end]
 
 
-def normalize_label(label: str) -> str:
-    """把标签规范化成脚本约定的两类。"""
-    s = str(label).strip().lower()
-    if s not in TURN_LABELS:
-        raise ValueError(f"Unsupported label={label!r}. Supported labels: {TURN_LABELS}")
-    return s
-
-
-def make_preprocess_fn(processor, default_prompt: str):
-    """
-    提前做轻量预处理：
-    - 标准化标签；
-    - 生成 prompt_text；
-    - 不提前读取音频。
-    """
+def make_preprocess_fn(detector: Qwen3GenerativeTurnDetector, default_prompt: str):
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
         prompt = ex.get("prompt", "") or default_prompt
         label = normalize_label(ex["label"])
-        prompt_text = build_turn_detection_prompt_text(processor, prompt)
+        prompt_text = build_turn_detection_prompt_text(detector.processor, prompt)
         return {
             "audio": ex["audio"],
-            "label_id": TURN_LABELS.index(label),
+            "target_label": label,
             "prompt_text": prompt_text,
             "cut_time_ms": ex.get("cut_time_ms", None),
             "left_context_ms": ex.get("left_context_ms", None),
@@ -119,24 +124,16 @@ def make_preprocess_fn(processor, default_prompt: str):
 
 
 @dataclass
-class DataCollatorForQwen3TurnDetection:
+class DataCollatorForQwen3TurnDetectionGenerative:
     processor: Any
     sampling_rate: int = 16000
     default_left_context_ms: float = 2000.0
     default_right_context_ms: float = 600.0
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """
-        把一批 turn detection 样本整理成模型输入。
-
-        关键步骤：
-        1. 从原始音频里裁出候选窗口；
-        2. 用 processor 同时编码 prompt_text 和音频；
-        3. 额外补上分类标签 `labels`。
-        """
         wavs = []
         prompt_texts = []
-        labels = []
+        targets = []
         for feature in features:
             wav = load_audio(feature["audio"], sr=self.sampling_rate)
             wav = slice_candidate_window(
@@ -152,21 +149,40 @@ class DataCollatorForQwen3TurnDetection:
             )
             wavs.append(wav)
             prompt_texts.append(feature["prompt_text"])
-            labels.append(int(feature["label_id"]))
+            targets.append(feature["target_label"])
 
-        inputs = self.processor(
+        eos = self.processor.tokenizer.eos_token or ""
+        full_texts = [prompt + target + eos for prompt, target in zip(prompt_texts, targets)]
+
+        full_inputs = self.processor(
+            text=full_texts,
+            audio=wavs,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        )
+        prefix_inputs = self.processor(
             text=prompt_texts,
             audio=wavs,
             return_tensors="pt",
             padding=True,
             truncation=False,
         )
-        inputs["labels"] = torch.tensor(labels, dtype=torch.long)
-        return inputs
+
+        prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
+        labels = full_inputs["input_ids"].clone()
+        for i, prefix_len in enumerate(prefix_lens):
+            labels[i, : int(prefix_len)] = -100
+
+        pad_id = self.processor.tokenizer.pad_token_id
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+
+        full_inputs["labels"] = labels
+        return full_inputs
 
 
 class CastFloatInputsTrainer(Trainer):
-    """和 ASR 训练脚本同理：把浮点输入自动 cast 到模型 dtype。"""
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
@@ -177,90 +193,78 @@ class CastFloatInputsTrainer(Trainer):
         return inputs
 
 
-class MakeEveryCheckpointLoadableCallback(TrainerCallback):
-    def on_save(self, args, state, control, **kwargs):
-        """每次保存 checkpoint 时写出自定义 detector 配置。"""
+def copy_required_hf_files_for_qwen_asr(src_dir: str, dst_dir: str):
+    os.makedirs(dst_dir, exist_ok=True)
+    required = [
+        "config.json",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "chat_template.json",
+        "merges.txt",
+        "vocab.json",
+    ]
+    for fn in required:
+        src = os.path.join(src_dir, fn)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dst_dir, fn))
+
+
+class MakeEveryCheckpointInferableCallback(TrainerCallback):
+    def __init__(self, base_model_path: str, prompt: str):
+        self.base_model_path = base_model_path
+        self.prompt = prompt
+
+    def _write_metadata(self, path: str):
+        payload = {
+            "base_model_path": self.base_model_path,
+            "prompt": self.prompt,
+            "labels": list(TURN_LABELS),
+        }
+        with open(os.path.join(path, "turn_detection_generative_config.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def on_save(self, args: TrainingArguments, state, control, **kwargs):
         if args.process_index != 0:
-            return control
-        model = kwargs.get("model", None)
-        if model is None:
             return control
         ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
         if os.path.isdir(ckpt_dir):
-            model.save_pretrained(ckpt_dir)
+            copy_required_hf_files_for_qwen_asr(self.base_model_path, ckpt_dir)
+            self._write_metadata(ckpt_dir)
+        return control
+
+    def on_train_end(self, args: TrainingArguments, state, control, **kwargs):
+        if args.process_index != 0:
+            return control
+        if os.path.isdir(args.output_dir):
+            copy_required_hf_files_for_qwen_asr(self.base_model_path, args.output_dir)
+            self._write_metadata(args.output_dir)
         return control
 
 
-def compute_metrics(eval_pred):
-    """
-    这里故意只算最基础的二分类指标，方便新手先把训练链路跑通。
-
-    当前最关心的是：
-    - accuracy：整体是否学到了；
-    - complete_precision / recall / f1：系统会不会过早“抢答”。
-    """
-    logits = eval_pred.predictions if hasattr(eval_pred, "predictions") else eval_pred[0]
-    labels = eval_pred.label_ids if hasattr(eval_pred, "label_ids") else eval_pred[1]
-    logits = np.asarray(logits, dtype=np.float64)
-    labels = np.asarray(labels, dtype=np.int64)
-    if logits.ndim > 2:
-        logits = logits.reshape(-1, logits.shape[-1])
-    if labels.ndim > 1:
-        labels = labels.reshape(-1)
-
-    logits = logits - logits.max(axis=-1, keepdims=True)
-    probs = np.exp(logits)
-    probs = probs / np.maximum(1e-12, probs.sum(axis=-1, keepdims=True))
-    complete_prob = probs[:, TURN_LABELS.index("complete")]
-
-    summary = summarize_binary_classification(
-        labels,
-        complete_prob,
-        pos_label=TURN_LABELS.index("complete"),
-        target_precision=0.97,
-    )
-    default_metrics = summary["threshold_default_0_5"]
-    return {
-        "accuracy": float(default_metrics["accuracy"]),
-        "complete_precision": float(default_metrics["precision"]),
-        "complete_recall": float(default_metrics["recall"]),
-        "complete_f1": float(default_metrics["f1"]),
-        "auroc": float(summary["auroc"]),
-        "auprc": float(summary["auprc"]),
-        "brier": float(summary["brier"]),
-        "ece": float(summary["ece"]),
-        "complete_precision_high_precision": float(summary["threshold_high_precision"]["precision"]),
-        "complete_recall_high_precision": float(summary["threshold_high_precision"]["recall"]),
-        "complete_f1_high_precision": float(summary["threshold_high_precision"]["f1"]),
-        "threshold_high_precision": float(summary["threshold_high_precision"]["threshold"]),
-        "threshold_balanced_f1": float(summary["threshold_balanced_f1"]["threshold"]),
-    }
-
-
 def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR Turn Detection Finetuning")
+    p = argparse.ArgumentParser("Qwen3-ASR Generative Turn Detection Finetuning")
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-0.6B")
     p.add_argument("--train_file", type=str, default="train_turn_detection.jsonl")
     p.add_argument("--eval_file", type=str, default="")
-    p.add_argument("--output_dir", type=str, default="./qwen3-turn-detection-out")
+    p.add_argument("--output_dir", type=str, default="./qwen3-turn-detection-generative-out")
     p.add_argument("--default_prompt", type=str, default=DEFAULT_TURN_DETECTION_PROMPT)
 
     p.add_argument("--sr", type=int, default=16000)
     p.add_argument("--default_left_context_ms", type=float, default=2000.0)
     p.add_argument("--default_right_context_ms", type=float, default=600.0)
 
-    # 参数冻结策略是这个脚本最重要的工程设计之一：
-    # - 默认冻结整个 backbone，只训练分类头；
-    # - 如果效果不够，再尝试逐步解冻高层；
-    # - 这样可以在数据不多时，最大限度复用底座的音频知识。
     p.add_argument("--freeze_audio_tower", type=int, default=1)
     p.add_argument("--freeze_text_model", type=int, default=1)
     p.add_argument("--unfreeze_last_n_layers", type=int, default=0)
-    p.add_argument("--pooling", type=str, default="last_token")
+    p.add_argument("--train_lm_head", type=int, default=1)
 
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--grad_acc", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--epochs", type=float, default=3)
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
@@ -279,8 +283,8 @@ def parse_args():
     p.add_argument("--resume", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--load_best_model_at_end", type=int, default=1)
-    p.add_argument("--metric_for_best_model", type=str, default="eval_complete_f1")
-    p.add_argument("--greater_is_better", type=int, default=1)
+    p.add_argument("--metric_for_best_model", type=str, default="eval_loss")
+    p.add_argument("--greater_is_better", type=int, default=0)
     p.add_argument("--early_stopping_patience", type=int, default=0)
     return p.parse_args()
 
@@ -289,24 +293,29 @@ def main():
     args_cli = parse_args()
     if not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required. Expected fields: audio, label, optional prompt/cut_time_ms.")
-    set_seed(int(args_cli.seed))
 
-    # 和 ASR 训练脚本一样，优先走 bf16；否则退到 fp16。
+    set_seed(int(args_cli.seed))
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
-    model = Qwen3TurnDetector.from_qwen3_asr_pretrained(
+
+    detector = Qwen3GenerativeTurnDetector.from_pretrained(
         args_cli.model_path,
         prompt=args_cli.default_prompt,
-        pooling=args_cli.pooling,
+        max_new_tokens=4,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
     )
-    model.set_trainable_parts(
+    detector.set_trainable_parts(
         freeze_audio_tower=(args_cli.freeze_audio_tower == 1),
         freeze_text_model=(args_cli.freeze_text_model == 1),
         unfreeze_last_n_layers=args_cli.unfreeze_last_n_layers,
+        train_lm_head=(args_cli.train_lm_head == 1),
     )
 
-    # 仍然沿用 JSON/JSONL，保持和 ASR SFT 相同的数据加载习惯。
+    model = detector.model
+    processor = detector.processor
+    patch_outer_forward(model)
+    model.generation_config = GenerationConfig.from_model_config(model.config)
+
     raw_ds = load_dataset(
         "json",
         data_files={
@@ -314,12 +323,11 @@ def main():
             **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
         },
     )
-    ds = raw_ds.map(make_preprocess_fn(model.processor, args_cli.default_prompt), num_proc=1)
+    ds = raw_ds.map(make_preprocess_fn(detector, args_cli.default_prompt), num_proc=1)
 
-    # 只保留训练真正需要的列。
     keep = {
         "audio",
-        "label_id",
+        "target_label",
         "prompt_text",
         "cut_time_ms",
         "left_context_ms",
@@ -330,17 +338,13 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForQwen3TurnDetection(
-        processor=model.processor,
+    collator = DataCollatorForQwen3TurnDetectionGenerative(
+        processor=processor,
         sampling_rate=args_cli.sr,
         default_left_context_ms=args_cli.default_left_context_ms,
         default_right_context_ms=args_cli.default_right_context_ms,
     )
 
-    # 这里的 TrainingArguments 基本就是 Hugging Face Trainer 的通用训练配置。
-    # 当前脚本同样还没有直接接入 DeepSpeed CLI。
-    # 如果你以后想把这个脚本升级到 deepspeed，最自然的改法还是：
-    # HfArgumentParser + dataclass + --deepspeed。
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
         per_device_train_batch_size=args_cli.batch_size,
@@ -358,7 +362,7 @@ def main():
         save_strategy=args_cli.save_strategy,
         save_steps=args_cli.save_steps,
         save_total_limit=args_cli.save_total_limit,
-        save_safetensors=False,
+        save_safetensors=True,
         eval_strategy="steps" if args_cli.eval_file else "no",
         eval_steps=args_cli.save_steps if args_cli.eval_file else None,
         do_eval=bool(args_cli.eval_file),
@@ -374,7 +378,9 @@ def main():
         greater_is_better=bool(args_cli.greater_is_better) if args_cli.eval_file else None,
     )
 
-    callbacks: List[TrainerCallback] = [MakeEveryCheckpointLoadableCallback()]
+    callbacks: List[TrainerCallback] = [
+        MakeEveryCheckpointInferableCallback(args_cli.model_path, args_cli.default_prompt)
+    ]
     if args_cli.eval_file and int(args_cli.early_stopping_patience) > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=int(args_cli.early_stopping_patience)))
 
@@ -384,7 +390,7 @@ def main():
         train_dataset=ds["train"],
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
-        compute_metrics=compute_metrics if args_cli.eval_file else None,
+        tokenizer=processor.tokenizer,
         callbacks=callbacks,
     )
 
@@ -393,7 +399,6 @@ def main():
         resume_from = find_latest_checkpoint(training_args.output_dir) or ""
 
     if resume_from:
-        # Trainer 会自动恢复模型、优化器、学习率调度器等状态。
         if trainer.args.process_index == 0:
             print(f"[resume] resume_from_checkpoint = {resume_from}")
         trainer.train(resume_from_checkpoint=resume_from)
@@ -401,7 +406,6 @@ def main():
         trainer.train()
 
     if trainer.args.process_index == 0:
-        # 训练结束后再保存一份最终模型，避免只剩中间 checkpoint。
         trainer.save_model(training_args.output_dir)
 
 
