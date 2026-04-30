@@ -26,9 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -36,34 +34,18 @@ import torch
 from datasets import load_dataset
 
 from qwen_asr import Qwen3ASRModel
-from qwen_asr.inference.utils import detect_and_fix_repetitions, normalize_audios, normalize_language_name
+from qwen_asr.inference.utils import (
+    LABEL_POSITION_MODES,
+    ParsedJointOutput,
+    normalize_audios,
+    normalize_language_name,
+    normalize_turn_label,
+    parse_joint_output,
+)
 from qwen_asr.turn_detection.metrics import finite_or_none, latency_summary
 
 
 TURN_LABELS = ("complete", "incomplete", "backchannel", "wait")
-TURN_LABEL_TOKENS = {f"<{label}>": label for label in TURN_LABELS}
-TURN_LABEL_TOKENS_UPPER = {token.upper(): label for token, label in TURN_LABEL_TOKENS.items()}
-LABEL_FIRST_MODES = ("label_first", "label_last", "auto")
-
-_ASR_TEXT_TAG = "<asr_text>"
-_TURN_STATE_TAG = "<turn_state>"
-_LANG_RE = re.compile(r"language\s+([^\n<]+)", re.IGNORECASE)
-_TAIL_LABEL_RE = re.compile(r"^(.*?)(<(?:complete|incomplete|backchannel|wait)>)\s*$", re.IGNORECASE | re.DOTALL)
-
-
-@dataclass
-class ParsedJointOutput:
-    raw_text: str
-    language: str
-    turn_label: Optional[str]
-    transcript: str
-    position_used: str
-    has_language_prefix: bool
-    has_asr_tag: bool
-    has_turn_state_tag: bool
-    has_label_token: bool
-    strict_schema_valid: bool
-    soft_parse_success: bool
 
 
 def parse_args():
@@ -74,7 +56,7 @@ def parse_args():
     p.add_argument("--output_json", type=str, default="")
     p.add_argument("--predictions_jsonl", type=str, default="")
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--label_position", type=str, choices=LABEL_FIRST_MODES, default="label_first")
+    p.add_argument("--label_position", type=str, choices=LABEL_POSITION_MODES, default="label_first")
     p.add_argument("--device_map", type=str, default="auto")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--case_insensitive", type=int, default=1)
@@ -109,137 +91,13 @@ def maybe_write_predictions(path: str, records: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _normalize_turn_label(label: Any) -> Optional[str]:
-    if label is None:
-        return None
-    s = str(label).strip().lower()
-    if not s:
-        return None
-    if s in TURN_LABELS:
-        return s
-    if s in TURN_LABEL_TOKENS:
-        return TURN_LABEL_TOKENS[s]
-    if s.upper() in TURN_LABEL_TOKENS_UPPER:
-        return TURN_LABEL_TOKENS_UPPER[s.upper()]
-    return None
-
-
-def _extract_language(meta_text: str) -> Tuple[str, bool]:
-    m = _LANG_RE.search(meta_text or "")
-    if not m:
-        return "", False
-    raw = (m.group(1) or "").strip()
-    if not raw:
-        return "", False
-    try:
-        return normalize_language_name(raw), True
-    except Exception:
-        return raw, True
-
-
-def _find_label_token(text: str) -> Optional[str]:
-    lower = str(text or "").lower()
-    for token, label in TURN_LABEL_TOKENS.items():
-        if token in lower:
-            return label
-    return None
-
-
-def _parse_label_first(text: str) -> ParsedJointOutput:
-    s = detect_and_fix_repetitions(str(text or "").strip())
-    has_asr_tag = _ASR_TEXT_TAG in s.lower()
-    meta_part = s
-    transcript = ""
-    if has_asr_tag:
-        idx = s.lower().find(_ASR_TEXT_TAG)
-        meta_part = s[:idx]
-        transcript = s[idx + len(_ASR_TEXT_TAG) :].strip()
-
-    language, has_language_prefix = _extract_language(meta_part)
-    has_turn_state_tag = _TURN_STATE_TAG in meta_part.lower()
-    turn_label = _find_label_token(meta_part)
-    has_label_token = turn_label is not None
-    strict_schema_valid = bool(has_language_prefix and has_asr_tag and has_turn_state_tag and has_label_token)
-    soft_parse_success = bool(has_asr_tag and has_label_token)
-    return ParsedJointOutput(
-        raw_text=s,
-        language=language,
-        turn_label=turn_label,
-        transcript=transcript,
-        position_used="label_first",
-        has_language_prefix=has_language_prefix,
-        has_asr_tag=has_asr_tag,
-        has_turn_state_tag=has_turn_state_tag,
-        has_label_token=has_label_token,
-        strict_schema_valid=strict_schema_valid,
-        soft_parse_success=soft_parse_success,
-    )
-
-
-def _parse_label_last(text: str) -> ParsedJointOutput:
-    s = detect_and_fix_repetitions(str(text or "").strip())
-    has_asr_tag = _ASR_TEXT_TAG in s.lower()
-    meta_part = s
-    text_part = ""
-    if has_asr_tag:
-        idx = s.lower().find(_ASR_TEXT_TAG)
-        meta_part = s[:idx]
-        text_part = s[idx + len(_ASR_TEXT_TAG) :].strip()
-
-    language, has_language_prefix = _extract_language(meta_part)
-    has_turn_state_tag = _TURN_STATE_TAG in meta_part.lower()
-    turn_label = None
-    transcript = text_part
-    m = _TAIL_LABEL_RE.match(text_part)
-    if m:
-        transcript = m.group(1).strip()
-        turn_label = _normalize_turn_label(m.group(2))
-    has_label_token = turn_label is not None
-    strict_schema_valid = bool(has_language_prefix and has_asr_tag and has_label_token)
-    soft_parse_success = bool(has_asr_tag and has_label_token)
-    return ParsedJointOutput(
-        raw_text=s,
-        language=language,
-        turn_label=turn_label,
-        transcript=transcript,
-        position_used="label_last",
-        has_language_prefix=has_language_prefix,
-        has_asr_tag=has_asr_tag,
-        has_turn_state_tag=has_turn_state_tag,
-        has_label_token=has_label_token,
-        strict_schema_valid=strict_schema_valid,
-        soft_parse_success=soft_parse_success,
-    )
-
-
-def parse_joint_output(text: Any, label_position: str) -> ParsedJointOutput:
-    label_position = str(label_position).strip().lower()
-    if label_position == "label_first":
-        return _parse_label_first(text)
-    if label_position == "label_last":
-        return _parse_label_last(text)
-
-    first = _parse_label_first(text)
-    last = _parse_label_last(text)
-
-    def _score(parsed: ParsedJointOutput) -> Tuple[int, int, int, int]:
-        return (
-            1 if parsed.strict_schema_valid else 0,
-            1 if parsed.soft_parse_success else 0,
-            1 if parsed.has_turn_state_tag else 0,
-            len(parsed.transcript),
-        )
-
-    return first if _score(first) >= _score(last) else last
-
-
 def parse_gold_row(row: Dict[str, Any], label_position: str) -> ParsedJointOutput:
     gold_text = row.get("text", "")
     parsed = parse_joint_output(gold_text, label_position=label_position)
 
-    gold_label = _normalize_turn_label(row.get("turn_label"))
+    gold_label = normalize_turn_label(row.get("turn_label"))
     if gold_label is None:
-        gold_label = _normalize_turn_label(row.get("label"))
+        gold_label = normalize_turn_label(row.get("label"))
     if gold_label is not None:
         parsed.turn_label = gold_label
 

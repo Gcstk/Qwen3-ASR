@@ -47,6 +47,28 @@ class EasyTurnLanguageCleanupTest(unittest.TestCase):
         self.assertNotIn("language ", prompt.lower())
         self.assertIn("<turn_state><标签><asr_text>", prompt)
 
+    def test_build_target_without_turn_state_namespace(self):
+        text = _TRAIN_CONVERTER.build_qwen_asr_target(
+            lang_name="Chinese",
+            transcript="好的",
+            label="backchannel",
+            output_format="label_first_no_turn_state",
+            predict_language=False,
+        )
+        self.assertEqual(text, "<backchannel><asr_text>好的")
+
+    def test_build_prompt_without_turn_state_namespace(self):
+        prompt = _TRAIN_CONVERTER.build_prompt(
+            task_text="<TRANSCRIBE> <BACKCHANNEL>",
+            prompt_mode="fixed",
+            fixed_prompt="",
+            predict_language=False,
+            output_format="label_first_no_turn_state",
+        )
+        self.assertNotIn("language ", prompt.lower())
+        self.assertNotIn("<turn_state>", prompt)
+        self.assertIn("<complete|incomplete|backchannel|wait><asr_text>", prompt)
+
     def test_postprocess_strips_language_from_text_and_prompt(self):
         record = {
             "text": "language Chinese<turn_state><wait><asr_text>闭嘴",
@@ -57,12 +79,34 @@ class EasyTurnLanguageCleanupTest(unittest.TestCase):
             record,
             prompt_strategy="rewrite",
             fixed_prompt=_POSTPROCESS.DEFAULT_PROMPT_NO_LANGUAGE,
+            output_format="label_first",
         )
         self.assertTrue(changed)
         self.assertEqual(updated["text"], "<turn_state><wait><asr_text>闭嘴")
         self.assertEqual(updated["predict_language"], 0)
         self.assertTrue(updated["easy_turn_lang_prediction_removed"])
         self.assertNotIn("language ", updated["prompt"].lower())
+
+    def test_postprocess_rewrites_old_turn_state_schema_into_new_label_first_schema(self):
+        record = {
+            "text": "language Chinese<turn_state><backchannel><asr_text>好的",
+            "prompt": "请转录音频内容，并严格使用格式：language 语种<turn_state><标签><asr_text>转写文本。",
+            "easy_turn_lang_qwen": "Chinese",
+            "output_format": "label_first",
+        }
+        updated, changed = _POSTPROCESS.transform_record(
+            record,
+            prompt_strategy="rewrite_pool",
+            fixed_prompt=_POSTPROCESS.DEFAULT_PROMPT_NO_LANGUAGE_NO_TURN_STATE,
+            output_format="label_first_no_turn_state",
+            prompt_pool=_POSTPROCESS.PROMPT_POOL_NO_LANGUAGE_NO_TURN_STATE,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(updated["text"], "<backchannel><asr_text>好的")
+        self.assertEqual(updated["output_format"], "label_first_no_turn_state")
+        self.assertTrue(updated["easy_turn_turn_state_removed"])
+        self.assertNotIn("<turn_state>", updated["prompt"])
+        self.assertIn(updated["prompt"], _POSTPROCESS.PROMPT_POOL_NO_LANGUAGE_NO_TURN_STATE)
 
     def test_postprocess_plain_asr_text_falls_back_to_asr_marker(self):
         text, changed = _POSTPROCESS.strip_language_prefix("language Chinese<asr_text>你好")

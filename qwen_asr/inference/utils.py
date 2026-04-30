@@ -15,6 +15,7 @@
 # limitations under the License.
 import base64
 import io
+import re
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Tuple, Union
@@ -68,6 +69,31 @@ SUPPORTED_LANGUAGES: List[str] = [
 ]
 _ASR_TEXT_TAG = "<asr_text>"
 _LANG_PREFIX = "language "
+_TURN_STATE_TAG = "<turn_state>"
+_LANG_RE = re.compile(r"language\s+([^\n<]+)", re.IGNORECASE)
+_TAIL_LABEL_RE = re.compile(
+    r"^(.*?)(<(?:complete|incomplete|backchannel|wait)>)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+TURN_LABELS: Tuple[str, ...] = ("complete", "incomplete", "backchannel", "wait")
+TURN_LABEL_TOKENS = {f"<{label}>": label for label in TURN_LABELS}
+TURN_LABEL_TOKENS_UPPER = {token.upper(): label for token, label in TURN_LABEL_TOKENS.items()}
+LABEL_POSITION_MODES: Tuple[str, ...] = ("label_first", "label_last", "auto")
+
+
+@dataclass
+class ParsedJointOutput:
+    raw_text: str
+    language: str
+    turn_label: Optional[str]
+    transcript: str
+    position_used: str
+    has_language_prefix: bool
+    has_asr_tag: bool
+    has_turn_state_tag: bool
+    has_label_token: bool
+    strict_schema_valid: bool
+    soft_parse_success: bool
 
 
 def normalize_language_name(language: str) -> str:
@@ -589,6 +615,190 @@ def parse_asr_output(
             break
 
     return lang, text_part.strip()
+
+
+def build_vllm_transcription_prompt(
+    audio_placeholder: str,
+    request_prompt: Optional[str] = None,
+    to_language: Optional[str] = None,
+) -> str:
+    """
+    Build the text prompt used by vLLM transcription requests.
+
+    Behavior:
+      - If request_prompt is provided, use the same system/user/assistant chat
+        layout as the training pipeline so task-specific prompts can steer the
+        output format.
+      - Otherwise, preserve the original ASR prompt behavior for compatibility.
+    """
+    request_prompt = (request_prompt or "").strip()
+    if request_prompt:
+        return (
+            f"<|im_start|>system\n{request_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    if to_language is None:
+        return (
+            f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+    return (
+        f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+        f"<|im_start|>assistant\nlanguage {to_language}<asr_text>"
+    )
+
+
+def normalize_turn_label(label: Any) -> Optional[str]:
+    if label is None:
+        return None
+    s = str(label).strip().lower()
+    if not s:
+        return None
+    if s in TURN_LABELS:
+        return s
+    if s in TURN_LABEL_TOKENS:
+        return TURN_LABEL_TOKENS[s]
+    if s.upper() in TURN_LABEL_TOKENS_UPPER:
+        return TURN_LABEL_TOKENS_UPPER[s.upper()]
+    return None
+
+
+def extract_joint_language(meta_text: str) -> Tuple[str, bool]:
+    m = _LANG_RE.search(meta_text or "")
+    if not m:
+        return "", False
+    raw = (m.group(1) or "").strip()
+    if not raw:
+        return "", False
+    try:
+        return normalize_language_name(raw), True
+    except Exception:
+        return raw, True
+
+
+def find_turn_label_token(text: str) -> Optional[str]:
+    lower = str(text or "").lower()
+    for token, label in TURN_LABEL_TOKENS.items():
+        if token in lower:
+            return label
+    return None
+
+
+def _parse_label_first_joint_output(text: str) -> ParsedJointOutput:
+    s = detect_and_fix_repetitions(str(text or "").strip())
+    s_lower = s.lower()
+    has_asr_tag = _ASR_TEXT_TAG in s_lower
+    meta_part = s
+    transcript = ""
+    if has_asr_tag:
+        idx = s_lower.find(_ASR_TEXT_TAG)
+        meta_part = s[:idx]
+        transcript = s[idx + len(_ASR_TEXT_TAG) :].strip()
+
+    language, has_language_prefix = extract_joint_language(meta_part)
+    has_turn_state_tag = _TURN_STATE_TAG in meta_part.lower()
+    turn_label = find_turn_label_token(meta_part)
+    has_label_token = turn_label is not None
+    strict_schema_valid = bool(has_language_prefix and has_asr_tag and has_turn_state_tag and has_label_token)
+    soft_parse_success = bool(has_asr_tag and has_label_token)
+    return ParsedJointOutput(
+        raw_text=s,
+        language=language,
+        turn_label=turn_label,
+        transcript=transcript,
+        position_used="label_first",
+        has_language_prefix=has_language_prefix,
+        has_asr_tag=has_asr_tag,
+        has_turn_state_tag=has_turn_state_tag,
+        has_label_token=has_label_token,
+        strict_schema_valid=strict_schema_valid,
+        soft_parse_success=soft_parse_success,
+    )
+
+
+def _parse_label_last_joint_output(text: str) -> ParsedJointOutput:
+    s = detect_and_fix_repetitions(str(text or "").strip())
+    s_lower = s.lower()
+    has_asr_tag = _ASR_TEXT_TAG in s_lower
+    meta_part = s
+    text_part = ""
+    if has_asr_tag:
+        idx = s_lower.find(_ASR_TEXT_TAG)
+        meta_part = s[:idx]
+        text_part = s[idx + len(_ASR_TEXT_TAG) :].strip()
+
+    language, has_language_prefix = extract_joint_language(meta_part)
+    has_turn_state_tag = _TURN_STATE_TAG in meta_part.lower()
+    turn_label = None
+    transcript = text_part
+    m = _TAIL_LABEL_RE.match(text_part)
+    if m:
+        transcript = m.group(1).strip()
+        turn_label = normalize_turn_label(m.group(2))
+    has_label_token = turn_label is not None
+    strict_schema_valid = bool(has_language_prefix and has_asr_tag and has_label_token)
+    soft_parse_success = bool(has_asr_tag and has_label_token)
+    return ParsedJointOutput(
+        raw_text=s,
+        language=language,
+        turn_label=turn_label,
+        transcript=transcript,
+        position_used="label_last",
+        has_language_prefix=has_language_prefix,
+        has_asr_tag=has_asr_tag,
+        has_turn_state_tag=has_turn_state_tag,
+        has_label_token=has_label_token,
+        strict_schema_valid=strict_schema_valid,
+        soft_parse_success=soft_parse_success,
+    )
+
+
+def parse_joint_output(text: Any, label_position: str = "label_first") -> ParsedJointOutput:
+    label_position = str(label_position).strip().lower()
+    if label_position == "label_first":
+        return _parse_label_first_joint_output(text)
+    if label_position == "label_last":
+        return _parse_label_last_joint_output(text)
+
+    first = _parse_label_first_joint_output(text)
+    last = _parse_label_last_joint_output(text)
+
+    def _score(parsed: ParsedJointOutput) -> Tuple[int, int, int, int]:
+        return (
+            1 if parsed.strict_schema_valid else 0,
+            1 if parsed.soft_parse_success else 0,
+            1 if parsed.has_turn_state_tag else 0,
+            len(parsed.transcript),
+        )
+
+    return first if _score(first) >= _score(last) else last
+
+
+def post_process_vllm_transcription_output(text: str) -> str:
+    """
+    Post-process transcription output conservatively.
+
+    Default ASR outputs in the form "language X<asr_text>..." should still be
+    trimmed to plain transcript. But if the model emits a structured joint
+    output such as "language X<turn_state><label><asr_text>...", keep the full
+    string so downstream code can parse the protocol fields.
+    """
+    if not text:
+        return ""
+
+    text = str(text).strip()
+    if _ASR_TEXT_TAG not in text:
+        return text
+
+    parsed = parse_joint_output(text, label_position="auto")
+    if parsed.has_turn_state_tag and parsed.has_label_token:
+        return parsed.raw_text
+
+    _, text_part = text.rsplit(_ASR_TEXT_TAG, 1)
+    return text_part.strip()
 
 
 def merge_languages(langs: List[str]) -> str:
