@@ -154,6 +154,263 @@ processor 必须知道：
 - 输入：音频原始长度
 - 输出：音频在模型输入里将占多少个位置
 
+
+这个函数的核心作用其实很单纯：
+
+> **给定输入音频特征在时间轴上的长度，估算经过音频塔前端 3 层 stride=2 卷积后，还剩多少个时间步。**
+
+对应代码在：
+[modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L404)
+
+函数本体是：
+
+```python
+def _get_feat_extract_output_lengths(input_lengths):
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+```
+
+先说结论，这个公式之所以这样写，是因为模型前端有两个事实：
+
+1. **时间维会经过 3 次 stride=2 下采样**
+   也就是三层卷积：
+   [modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L739)
+   [modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L740)
+   [modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L741)
+
+```python
+self.conv2d1 = nn.Conv2d(..., 3, 2, padding=1)
+self.conv2d2 = nn.Conv2d(..., 3, 2, padding=1)
+self.conv2d3 = nn.Conv2d(..., 3, 2, padding=1)
+```
+
+2. **卷积前不会把整条长语音一次性直接卷，而是先按 100 帧为一个块切开**
+   这里的 100 来自 `self.n_window * 2`，实际 forward 里就是按这个长度切块：
+   [modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L803)
+   [modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L818)
+
+所以这个函数不是在算“一个连续长序列卷完之后的长度”，而是在算：
+
+> **完整 100 帧块的贡献 + 最后不足 100 帧尾块的贡献**
+
+---
+
+## 1. 单层卷积为什么是 `(L - 1) // 2 + 1`
+
+卷积参数是：
+
+- kernel size = 3
+- stride = 2
+- padding = 1
+
+标准 1D/2D 卷积在某一维上的输出长度公式是：
+
+$
+L_{out} = \left\lfloor \frac{L_{in} + 2p - k}{s} \right\rfloor + 1
+$
+
+代进去：
+
+- \(p = 1\)
+- \(k = 3\)
+- \(s = 2\)
+
+得到：
+
+$
+L_{out} = \left\lfloor \frac{L_{in} + 2 - 3}{2} \right\rfloor + 1
+= \left\lfloor \frac{L_{in} - 1}{2} \right\rfloor + 1
+$
+
+也就是代码里的：
+
+```python
+(L - 1) // 2 + 1
+```
+
+这个式子你也可以直观理解成：
+
+- 大致就是“长度减半”
+- 但因为 padding=1、kernel=3，不是简单 `L//2`
+- 它等价于 `ceil(L/2)`
+
+举例：
+
+- `L=100 -> 50`
+- `L=99 -> 50`
+- `L=1 -> 1`
+
+---
+
+## 2. 为什么完整 100 帧块直接写成 `* 13`
+
+因为 100 帧经过 3 次这样的 stride-2 下采样后：
+
+### 第一次
+$
+100 \to \left\lfloor \frac{99}{2} \right\rfloor + 1 = 50
+$
+
+### 第二次
+$
+50 \to \left\lfloor \frac{49}{2} \right\rfloor + 1 = 25
+$
+
+### 第三次
+$
+25 \to \left\lfloor \frac{24}{2} \right\rfloor + 1 = 13
+$
+
+所以：
+
+> **每一个完整的 100 帧 chunk，卷完以后固定产出 13 个时间步**
+
+这就是公式最后这项：
+
+```python
+(input_lengths // 100) * 13
+```
+
+含义就是：
+
+- `input_lengths // 100`：有多少个完整的 100 帧块
+- 每块贡献 `13`
+- 所以完整块总贡献就是它们的乘积
+
+---
+
+## 3. 为什么还要单独算 `input_lengths % 100`
+
+因为最后通常会剩一个不足 100 帧的尾块。
+
+例如：
+
+- 230 帧 = 2 个完整 100 帧块 + 30 帧尾块
+- 前 200 帧固定贡献 `2 * 13 = 26`
+- 剩下 30 帧还要再卷 3 次，算出尾块贡献
+
+所以：
+
+```python
+input_lengths_leave = input_lengths % 100
+```
+
+就是取尾块长度。
+
+---
+
+## 4. `feat_lengths` 和后面的嵌套公式在干什么
+
+这两行：
+
+```python
+feat_lengths = (input_lengths_leave - 1) // 2 + 1
+output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+```
+
+其实就是把尾块长度连续过 3 次相同卷积公式。
+
+如果把它完全展开，会更好懂：
+
+```python
+tail1 = (tail - 1) // 2 + 1
+tail2 = (tail1 - 1) // 2 + 1
+tail3 = (tail2 - 1) // 2 + 1
+output = full_chunks * 13 + tail3
+```
+
+而原代码只是把它压缩写了。
+
+所以：
+
+- `feat_lengths` 实际上是尾块过第一层卷积后的长度
+- 后面 `((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1`
+  就是再过第二、第三层卷积
+
+---
+
+## 5. 为什么不直接对整个 `input_lengths` 连续做 3 次公式
+
+你可能会想，既然每层卷积公式都知道，为什么不直接写成：
+
+```python
+l1 = (input_lengths - 1) // 2 + 1
+l2 = (l1 - 1) // 2 + 1
+l3 = (l2 - 1) // 2 + 1
+```
+
+这是因为**真实实现不是对整条时间轴一次性卷积，而是先切成多个 100 帧 chunk 再卷积**。
+
+也就是说，真实计算图是：
+
+- 100 帧一块切开
+- 每块独立过 3 层卷积
+- 再把所有块拼起来
+
+这个过程和“整段直接卷”在边界上不一定完全等价。  
+所以长度计算也必须按 chunk 方式来，才能和真实前向严格对齐。
+
+这一点在 forward 里是明确写出来的：
+[modeling_qwen3_asr.py](E:/Work/AI/AUDIO/Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py#L801)
+
+---
+
+## 6. 举个完整例子
+
+假设输入长度 `input_lengths = 230`
+
+### 第一步：完整块和尾块
+- 完整块数：`230 // 100 = 2`
+- 尾块长度：`230 % 100 = 30`
+
+### 第二步：完整块贡献
+- 每块 100 帧 -> 13
+- 所以完整块贡献：`2 * 13 = 26`
+
+### 第三步：尾块贡献
+30 帧过三层：
+
+- 第一层：`(30 - 1)//2 + 1 = 15`
+- 第二层：`(15 - 1)//2 + 1 = 8`
+- 第三层：`(8 - 1)//2 + 1 = 4`
+
+### 最终
+- `26 + 4 = 30`
+
+所以 230 帧最终对应 30 个卷积后时间步。
+
+---
+
+## 7. 一个容易忽略的小点：尾块为 0 时为什么不会出错
+
+如果输入刚好是 100 的整数倍，比如 200：
+
+- `input_lengths_leave = 0`
+
+这时：
+
+```python
+feat_lengths = (0 - 1) // 2 + 1
+```
+
+在整数除法下结果会变成 0，后面继续算尾块贡献也还是 0。
+
+所以：
+
+- 没有尾块时，尾块贡献自然为 0
+- 总输出只剩 `完整块数 * 13`
+
+这是故意利用整数卷积公式做到的。
+
+---
+
+## 8. 一句话总结
+
+这个公式本质上是在做：
+
+> **先按 100 帧分块；每个完整块固定映射到 13 个时间步；最后不足 100 帧的尾块再按 3 层 `kernel=3, stride=2, padding=1` 卷积公式单独计算。**
 ---
 
 ### 2.3 `Qwen3ASRProcessor` 类本体

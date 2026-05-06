@@ -19,13 +19,15 @@ qwen_asr: Qwen3-ASR package.
 
 from .inference.qwen3_asr import Qwen3ASRModel
 from .inference.qwen3_forced_aligner import Qwen3ForcedAligner
-from .turn_detection import Qwen3TurnDetector
+from .turn_detection import Qwen3TurnDetector, Qwen3GenerativeTurnDetector
 
-from .inference.utils import parse_asr_output
+from .inference.utils import parse_asr_output, parse_joint_output
 
 __all__ = [
     "Qwen3ASRModel",
     "Qwen3ForcedAligner",
     "Qwen3TurnDetector",
+    "Qwen3GenerativeTurnDetector",
     "parse_asr_output",
+    "parse_joint_output",
 ]
