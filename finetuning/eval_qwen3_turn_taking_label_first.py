@@ -397,7 +397,7 @@ def evaluate_split(model: Qwen3ASRModel, records: List[Dict[str, Any]], args, sp
             pred = parse_joint_output(raw_out, label_position=args.label_position)
 
             pred_turn_label = pred.turn_label
-            gold_turn_label = _normalize_turn_label(gold.turn_label)
+            gold_turn_label = normalize_turn_label(gold.turn_label)
 
             gold_lang = gold.language or ""
             pred_lang = pred.language or ""
